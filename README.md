@@ -70,17 +70,13 @@
 ### 1. Клонирование репозитория
 
 ```
-
 git clone https://github.com/YourUsername/ComfyUI-TelegramBot.git
 cd ComfyUI-TelegramBot
-
 ```
 
 ### 2. Установка зависимостей
 
 ```
-
-
 # Создание виртуальной среды (рекомендуется)
 
 python -m venv venv
@@ -96,7 +92,6 @@ source venv/bin/activate
 # Установка библиотек
 
 pip install -r requirements.txt
-
 ```
 
 ### 3. Настройка
@@ -104,8 +99,6 @@ pip install -r requirements.txt
 Создайте файл `.env` в корне проекта:
 
 ```
-
-
 # Обязательные параметры
 
 BOT_TOKEN=your_telegram_bot_token_here
@@ -122,7 +115,6 @@ SHARED_OUTPUT_DIR=shared_output
 
 RESTART_COMMAND=restart_comfyui.bat
 WORKFLOW_TEMPLATES_DIR=templates
-
 ```
 
 ### 4. Структура папок
@@ -130,21 +122,17 @@ WORKFLOW_TEMPLATES_DIR=templates
 Создайте следующие папки (или они создадутся автоматически):
 
 ```
-
 ComfyUI-TelegramBot/
 ├── data/              \# Пользовательские workflow и настройки
 ├── Output/            \# Сгенерированные файлы
 ├── shared_output/     \# Общая папка вывода (если используется)
 └── templates/         \# Локальные шаблоны workflow (опционально)
-
 ```
 
 ### 5. Запуск
 
 ```
-
 python bot.py
-
 ```
 
 При первом запуске бот покажет ссылку на себя в Telegram.
@@ -211,9 +199,7 @@ python bot.py
 Установите параметр `RESTART_COMMAND` в `.env` для автоматического перезапуска ComfyUI при ошибках:
 
 ```
-
 RESTART_COMMAND=C:\ComfyUI\restart.bat
-
 ```
 
 ---
