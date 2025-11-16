@@ -41,13 +41,13 @@
 ## 🎬 Демонстрация
 
 ### Главное меню после /start
-(<img width="552" height="375" alt="image" src="https://github.com/user-attachments/assets/70b5c8ec-6627-4f1a-a6ec-8d7981ba2c0d" />)
+<img width="552" height="375" alt="image" src="https://github.com/user-attachments/assets/70b5c8ec-6627-4f1a-a6ec-8d7981ba2c0d" />
 
 ### Просмотр и редактирование нод
-(<img width="904" height="954" alt="image" src="https://github.com/user-attachments/assets/031be0aa-c977-4bfd-b40d-cd074fb74c84" />)
+<img width="904" height="954" alt="image" src="https://github.com/user-attachments/assets/031be0aa-c977-4bfd-b40d-cd074fb74c84" />
 
 ### Real-time генерация с превью
-(<img width="494" height="905" alt="image" src="https://github.com/user-attachments/assets/84df83c2-5535-423d-a4ab-a6521543c88e" />)
+<img width="494" height="905" alt="image" src="https://github.com/user-attachments/assets/84df83c2-5535-423d-a4ab-a6521543c88e" />
 
 ---
 
