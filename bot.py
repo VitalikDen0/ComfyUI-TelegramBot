@@ -130,6 +130,16 @@ MODEL_PARAM_TYPE_BY_NODE: Dict[tuple[str, str], str] = {
     ("CheckpointLoader", "clip_name"): "clip",
     ("LoraLoader", "lora_name"): "loras",
     ("LoRALoader", "lora_name"): "loras",
+    ("LoraLoaderModelOnly", "lora_name"): "loras",
+    ("LoraLoaderStacked", "lora_name"): "loras",
+    ("LoRAStacker", "lora_name"): "loras",
+    ("ControlNetLoader", "controlnet_name"): "controlnet",
+    ("ControlNetLoader", "control_net_name"): "controlnet",
+    ("ControlNetApplyAdvanced", "control_net_name"): "controlnet",
+    ("IPAdapterLoader", "ipadapter_name"): "ipadapter",
+    ("IPAdapterLoader", "ip_adapter_name"): "ipadapter",
+    ("HypernetworkLoader", "hypernetwork_name"): "hypernetworks",
+    ("TextualInversionLoader", "embedding_name"): "embeddings",
 }
 
 GENERIC_MODEL_PARAM_TYPES: Dict[str, str] = {
@@ -137,6 +147,14 @@ GENERIC_MODEL_PARAM_TYPES: Dict[str, str] = {
     "vae_name": "vae",
     "clip_name": "clip",
     "lora_name": "loras",
+    "controlnet_name": "controlnet",
+    "control_net_name": "controlnet",
+    "ipadapter_name": "ipadapter",
+    "ip_adapter_name": "ipadapter",
+    "hypernetwork_name": "hypernetworks",
+    "embedding_name": "embeddings",
+    "ti_name": "embeddings",
+    "vae_path": "vae",
 }
 
 CATALOG_CACHE_FILE = "object_info_cache.json"
@@ -6133,6 +6151,8 @@ async def _ensure_keyboard_mode(
     if not force_send and previous == mode:
         return
 
+    _clear_dynamic_buttons(context)
+
     if mode == "menu":
         markup = _menu_reply_keyboard(context, user_id)
     elif mode == "workflow":
@@ -6150,7 +6170,6 @@ async def _ensure_keyboard_mode(
     else:
         markup = ReplyKeyboardRemove()
 
-    _clear_dynamic_buttons(context)
     await respond(source, KEYBOARD_UPDATED_TEXT, markup, parse_mode=ParseMode.HTML)
 
 
