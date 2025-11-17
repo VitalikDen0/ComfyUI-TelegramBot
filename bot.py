@@ -37,6 +37,10 @@ from workflow_render import format_workflow_summary
 
 LOGGER = logging.getLogger(__name__)
 
+USER_LOGGERS: dict[int, logging.Logger] = {}
+USER_LOG_BASE_DIR: Optional[Path] = None
+USER_LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -89,6 +93,9 @@ TEMPLATE_ERROR_KEY = "template_error"
 TEMPLATE_BACK = "template:back"
 WORKFLOW_SELECT_PREFIX = "workflow:select:"
 WORKFLOW_LIBRARY_PAGE_PREFIX = "workflow:page:"
+WORKFLOW_DELETE_PREFIX = "workflow:delete:"
+WORKFLOW_DELETE_CONFIRM_PREFIX = "workflow:delete-confirm:"
+WORKFLOW_DELETE_CANCEL_PREFIX = "workflow:delete-cancel:"
 NOTIFY_TOGGLE_PREFIX = "notify:toggle:"
 
 WORKFLOW_LAUNCH = "workflow:launch"
@@ -610,6 +617,127 @@ class BotResources:
         await self.client.close()
 
 
+def _get_user_logs_dir(config: BotConfig) -> Path:
+    global USER_LOG_BASE_DIR
+    base_dir = USER_LOG_BASE_DIR
+    if base_dir is None:
+        base_dir = (config.data_dir / "logs" / "users").resolve()
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:  # pragma: no cover - лог должен быть best-effort
+        LOGGER.warning("Не удалось подготовить директорию логов пользователей: %s", base_dir, exc_info=True)
+    USER_LOG_BASE_DIR = base_dir
+    return base_dir
+
+
+def _ensure_user_logger(resources: BotResources, user_id: int) -> logging.Logger:
+    logger = USER_LOGGERS.get(user_id)
+    log_dir = _get_user_logs_dir(resources.config)
+    log_path = log_dir / f"{user_id}.log"
+
+    if logger is None:
+        logger = logging.getLogger(f"user.{user_id}")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+
+    expected_path = str(log_path)
+    has_handler = False
+    for handler in list(logger.handlers):
+        if isinstance(handler, logging.FileHandler):
+            if handler.baseFilename == expected_path:
+                has_handler = True
+                continue
+            logger.removeHandler(handler)
+
+    if not has_handler:
+        handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        handler.setFormatter(logging.Formatter(USER_LOG_FORMAT))
+        logger.addHandler(handler)
+
+    USER_LOGGERS[user_id] = logger
+    return logger
+
+
+def _serialize_log_value(value: Any) -> str:
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    if isinstance(value, Path):
+        return json.dumps(str(value), ensure_ascii=False)
+    if isinstance(value, (str, int, bool)) or value is None:
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, dict)):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except TypeError:
+            return json.dumps(repr(value), ensure_ascii=False)
+    return json.dumps(repr(value), ensure_ascii=False)
+
+
+def _format_log_extra(extra: Mapping[str, Any]) -> str:
+    parts: list[str] = []
+    for key in sorted(extra):
+        parts.append(f"{key}={_serialize_log_value(extra[key])}")
+    return " ".join(parts)
+
+
+def _log_user_event(resources: BotResources, user_id: int, event: str, **extra: Any) -> None:
+    try:
+        logger = _ensure_user_logger(resources, user_id)
+    except Exception:  # pragma: no cover - логирование не должно ломать основной поток
+        LOGGER.debug("Не удалось получить логгер пользователя", exc_info=True)
+        logger = None
+
+    filtered_extra = {key: value for key, value in extra.items() if value is not None}
+    suffix = _format_log_extra(filtered_extra) if filtered_extra else ""
+    message = event if not suffix else f"{event} | {suffix}"
+
+    if logger is not None:
+        logger.info(message)
+
+    general_text = f"user={user_id} {event}"
+    if suffix:
+        general_text = f"{general_text} {suffix}"
+    LOGGER.info(general_text)
+
+
+def _ensure_default_assets(config: BotConfig) -> None:
+    default_path = config.default_workflow_path
+    if default_path is None:
+        LOGGER.debug("Default workflow path не настроен")
+        return
+
+    if not default_path.exists():
+        LOGGER.warning("Файл default workflow %s не найден", default_path)
+        return
+
+    templates_dir = config.workflow_templates_dir
+    if not templates_dir:
+        return
+
+    destination_dir = templates_dir / "builtin"
+    try:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        LOGGER.warning("Не удалось создать каталог шаблонов %s", destination_dir, exc_info=True)
+        return
+
+    destination = destination_dir / default_path.name
+    try:
+        if not destination.exists():
+            shutil.copy2(default_path, destination)
+        else:
+            try:
+                source_stat = default_path.stat()
+                dest_stat = destination.stat()
+            except OSError:
+                shutil.copy2(default_path, destination)
+            else:
+                if source_stat.st_mtime > dest_stat.st_mtime + 1e-6 or source_stat.st_size != dest_stat.st_size:
+                    shutil.copy2(default_path, destination)
+    except Exception:
+        LOGGER.warning("Не удалось синхронизировать default workflow в каталог шаблонов", exc_info=True)
+
+
 def _apply_default_filename_prefix(workflow: Dict[str, Any], prefix: str = DEFAULT_FILENAME_PREFIX) -> None:
     nodes = workflow.get("nodes")
     if isinstance(nodes, dict):
@@ -658,6 +786,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = get_user_id(update)
     user_data = get_user_data(context)
     user_data.setdefault("workflow_name", "default")
+    resources = require_resources(context)
+    workflow = resources.storage.ensure_default_workflow_for_user(user_id)
+    if workflow is not None:
+        user_data.setdefault("workflow", workflow)
     await _remove_reply_keyboard(update)
     await send_main_menu(update, context, user_id)
 
@@ -771,6 +903,24 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.answer("Некорректный выбор", show_alert=True)
             return
         await _load_saved_workflow(query, context, index)
+    elif data.startswith(WORKFLOW_DELETE_PREFIX):
+        index_text = data[len(WORKFLOW_DELETE_PREFIX) :]
+        try:
+            index = int(index_text)
+        except ValueError:
+            await query.answer("Некорректный выбор", show_alert=True)
+            return
+        await _prompt_workflow_deletion(query, context, index)
+    elif data.startswith(WORKFLOW_DELETE_CONFIRM_PREFIX):
+        index_text = data[len(WORKFLOW_DELETE_CONFIRM_PREFIX) :]
+        try:
+            index = int(index_text)
+        except ValueError:
+            await query.answer("Некорректный выбор", show_alert=True)
+            return
+        await _confirm_workflow_deletion(query, context, index)
+    elif data.startswith(WORKFLOW_DELETE_CANCEL_PREFIX):
+        await _cancel_workflow_deletion(query, context)
     elif data == MENU_BACK:
         await send_main_menu(query, context, query.from_user.id, edit=True)
     elif data == WORKFLOW_LAUNCH:
@@ -904,11 +1054,13 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def create_workflow(message_source: MessageSource, context: ContextTypes.DEFAULT_TYPE) -> None:
     resources = require_resources(context)
     user_id = get_user_id_from_source(message_source)
-    workflow = {"nodes": {}}
+    workflow_template = resources.storage.load_default_workflow()
+    workflow = workflow_template if isinstance(workflow_template, dict) else {"nodes": {}}
     user_data = get_user_data(context)
-    user_data["workflow_name"] = "default"
+    workflow_name = str(user_data.get("workflow_name") or "default")
+    user_data["workflow_name"] = workflow_name
     user_data["workflow"] = workflow
-    _persist_workflow(resources, user_id, workflow)
+    _persist_workflow(resources, user_id, workflow, workflow_name)
     await _flush_persistence(context)
 
     text = (
@@ -2026,6 +2178,7 @@ async def show_workflow_library(
 ) -> None:
     resources = require_resources(context)
     user_id = get_user_id_from_source(message_source)
+    resources.storage.ensure_default_workflow_for_user(user_id)
 
     _clear_dynamic_buttons(context)
     await _ensure_keyboard_mode(message_source, context, user_id, "menu")
@@ -2060,6 +2213,7 @@ async def show_workflow_library(
     end = min(start + WORKFLOW_LIBRARY_PAGE_SIZE, total)
 
     current_name = str(user_data.get("workflow_name") or "")
+    user_data["workflow_library_page"] = page
 
     lines = [
         "<b>🗃️ Ваши workflow</b>",
@@ -2077,6 +2231,10 @@ async def show_workflow_library(
         lines.append(f"{offset}. <b>{escape(name)}</b>{' — текущий' if name == current_name else ''}")
         buttons.append([
             InlineKeyboardButton(display, callback_data=f"{WORKFLOW_SELECT_PREFIX}{offset - 1}")
+        ])
+        delete_label = f"🗑 Удалить '{_short_label(name, 20)}'"
+        buttons.append([
+            InlineKeyboardButton(delete_label, callback_data=f"{WORKFLOW_DELETE_PREFIX}{offset - 1}")
         ])
 
     nav_row: list[InlineKeyboardButton] = []
@@ -2099,6 +2257,94 @@ async def show_workflow_library(
         parse_mode=ParseMode.HTML,
         edit=via_callback,
     )
+
+
+async def _prompt_workflow_deletion(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, index: int) -> None:
+    user_data = get_user_data(context)
+    names = user_data.get("workflow_library_names")
+    if not isinstance(names, list) or index < 0 or index >= len(names):
+        await query.answer("Workflow недоступен", show_alert=True)
+        return
+
+    name = names[index]
+    message_text = (
+        f"❗️ Удалить workflow <b>{escape(name)}</b>?"
+        "\nФайл и все сохранённые версии будут удалены безвозвратно."
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Да, удалить", callback_data=f"{WORKFLOW_DELETE_CONFIRM_PREFIX}{index}")],
+            [InlineKeyboardButton("↩️ Отмена", callback_data=WORKFLOW_DELETE_CANCEL_PREFIX)],
+        ]
+    )
+
+    await respond(query, message_text, keyboard, parse_mode=ParseMode.HTML, edit=True)
+
+
+async def _cancel_workflow_deletion(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await query.answer()
+    except Exception:  # pragma: no cover - optional ack
+        LOGGER.debug("Failed to acknowledge workflow deletion cancel", exc_info=True)
+
+    user_data = get_user_data(context)
+    page_value = user_data.get("workflow_library_page", 0)
+    try:
+        page = int(page_value)
+    except (TypeError, ValueError):
+        page = 0
+
+    await show_workflow_library(query, context, page=page, via_callback=True)
+
+
+async def _confirm_workflow_deletion(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, index: int) -> None:
+    user = query.from_user
+    if user is None:
+        await query.answer("Пользователь не найден", show_alert=True)
+        return
+
+    user_data = get_user_data(context)
+    names = user_data.get("workflow_library_names")
+    if not isinstance(names, list) or index < 0 or index >= len(names):
+        await query.answer("Workflow недоступен", show_alert=True)
+        return
+
+    name = names[index]
+    resources = require_resources(context)
+
+    try:
+        resources.storage.delete_workflow(user.id, name)
+    except Exception as exc:  # pragma: no cover - filesystem issues
+        LOGGER.exception("Failed to delete workflow", exc_info=True)
+        _log_user_event(resources, user.id, "workflow_delete_failed", workflow=name, error=str(exc))
+        await query.answer("Не удалось удалить", show_alert=True)
+        return
+
+    _log_user_event(resources, user.id, "workflow_deleted", workflow=name)
+    LOGGER.info("Workflow удалён: user=%s workflow=%s", user.id, name)
+
+    if str(user_data.get("workflow_name")) == name:
+        user_data.pop("workflow", None)
+        remaining = list(resources.storage.list_workflows(user.id))
+        if remaining:
+            user_data["workflow_name"] = remaining[0]
+        else:
+            user_data["workflow_name"] = "default"
+
+    await _flush_persistence(context)
+
+    try:
+        await query.answer(f"Удалено: {name}", show_alert=True)
+    except Exception:  # pragma: no cover - optional ack
+        LOGGER.debug("Failed to acknowledge workflow deletion", exc_info=True)
+
+    page_value = user_data.get("workflow_library_page", 0)
+    try:
+        page = int(page_value)
+    except (TypeError, ValueError):
+        page = 0
+
+    await show_workflow_library(query, context, page=page, via_callback=True)
 
 
 async def _load_saved_workflow(
@@ -2300,6 +2546,9 @@ async def launch_workflow(message_source: MessageSource, context: ContextTypes.D
         if chat_id is not None and message_id is not None:
             LOGGER.debug("Workflow already running for user_id=%s, message_id=%s", user_id, message_id)
 
+        _log_user_event(resources, user_id, "launch_skipped_active_run", workflow=user_data.get("workflow_name"))
+        LOGGER.info("Повторный запуск отклонён: user=%s", user_id)
+
         await respond(
             message_source,
             "⏳ Выполнение уже запущено. Используйте кнопку ниже, чтобы остановить его.",
@@ -2347,6 +2596,27 @@ async def launch_workflow(message_source: MessageSource, context: ContextTypes.D
     progress_labels = _build_progress_labels(workflow, prompt_payload)
     expected_outputs = _estimate_expected_outputs(prompt_payload)
 
+    prompt_nodes = prompt_payload.get("prompt")
+    node_count = len(prompt_nodes) if isinstance(prompt_nodes, dict) else None
+    seed_override_count = sum(len(params) for params in seed_overrides.values()) if seed_overrides else 0
+    _log_user_event(
+        resources,
+        user_id,
+        "launch_prepared",
+        workflow=workflow_name,
+        nodes=node_count,
+        expected_outputs=expected_outputs,
+        seed_overrides=seed_override_count,
+    )
+    LOGGER.info(
+        "Подготовка запуска: user=%s workflow=%s nodes=%s expected_outputs=%s seed_overrides=%s",
+        user_id,
+        workflow_name,
+        node_count,
+        expected_outputs,
+        seed_override_count,
+    )
+
     await respond(
         message_source,
         f"{warning_block}🚀 Отправляю workflow в ComfyUI…",
@@ -2362,6 +2632,7 @@ async def launch_workflow(message_source: MessageSource, context: ContextTypes.D
             prompt_id, client_id = await resources.client.submit_workflow(prompt_payload)
         except Exception as exc:  # pragma: no cover - network failure
             LOGGER.exception("Failed to submit workflow")
+            _log_user_event(resources, user_id, "workflow_submit_failed", workflow=workflow_name, error=str(exc))
             _log_history_entry(context, resources, user_id, None, status="error", error=str(exc))
             await respond(
                 message_source,
@@ -2370,6 +2641,17 @@ async def launch_workflow(message_source: MessageSource, context: ContextTypes.D
                 parse_mode=ParseMode.HTML,
             )
             return
+
+        run_started_at = time.perf_counter()
+        _log_user_event(
+            resources,
+            user_id,
+            "workflow_submitted",
+            workflow=workflow_name,
+            prompt_id=prompt_id,
+            client_id=client_id,
+        )
+        LOGGER.info("Workflow отправлен: user=%s workflow=%s prompt_id=%s client_id=%s", user_id, workflow_name, prompt_id, client_id)
 
         status_message = await respond(
             message_source,
@@ -2401,7 +2683,27 @@ async def launch_workflow(message_source: MessageSource, context: ContextTypes.D
             "shared_dirs": [str(path) for path in shared_dirs],
             "shared_snapshot": _snapshot_directories(shared_dirs),
             "output_scan_started": time.time(),
+            "started_at_perf": run_started_at,
+            "workflow_name": workflow_name,
         }
+
+        _log_user_event(
+            resources,
+            user_id,
+            "workflow_execution_started",
+            workflow=workflow_name,
+            prompt_id=prompt_id,
+            expected_outputs=expected_outputs,
+            seed_overrides=seed_override_count,
+            shared_dirs=len(shared_dirs),
+        )
+        LOGGER.info(
+            "Workflow в очереди: user=%s workflow=%s prompt_id=%s shared_dirs=%s",
+            user_id,
+            workflow_name,
+            prompt_id,
+            len(shared_dirs),
+        )
 
         pending_progress_text: Optional[str] = None
         pending_preview: Optional[PreviewPayload] = None
@@ -2465,10 +2767,19 @@ async def launch_workflow(message_source: MessageSource, context: ContextTypes.D
                 if isinstance(edited, Message):
                     status_message = edited
                 await _ensure_keyboard_mode(status_message, context, user_id, "workflow", ensure_message=True, force_send=True)
+            _log_user_event(resources, user_id, "workflow_execution_cancelled", workflow=workflow_name, prompt_id=prompt_id)
             return
         except Exception as exc:  # pragma: no cover - unexpected runtime failure
             await flush_progress(force=True)
             LOGGER.exception("Error while tracking workflow progress")
+            _log_user_event(
+                resources,
+                user_id,
+                "workflow_progress_error",
+                workflow=workflow_name,
+                prompt_id=prompt_id,
+                error=str(exc),
+            )
             _log_history_entry(context, resources, user_id, prompt_id, status="error", error=str(exc))
             if status_message:
                 edited = await edit_message(
@@ -2494,6 +2805,7 @@ async def cancel_workflow(message_source: MessageSource, context: ContextTypes.D
     user_data = get_user_data(context)
     run_info = user_data.get("active_run")
     if not run_info:
+        _log_user_event(resources, user_id, "workflow_cancel_requested", workflow=user_data.get("workflow_name"), active=False)
         if isinstance(message_source, CallbackQuery):
             await message_source.answer("Нет активного запуска.", show_alert=True)
         else:
@@ -2511,6 +2823,16 @@ async def cancel_workflow(message_source: MessageSource, context: ContextTypes.D
 
     chat_id = run_info.get("chat_id")
     message_id = run_info.get("message_id")
+    prompt_id = run_info.get("prompt_id")
+
+    _log_user_event(
+        resources,
+        user_id,
+        "workflow_cancel_requested",
+        workflow=user_data.get("workflow_name"),
+        prompt_id=prompt_id,
+        active=True,
+    )
 
     if chat_id is not None and message_id is not None:
         try:
@@ -2527,6 +2849,7 @@ async def cancel_workflow(message_source: MessageSource, context: ContextTypes.D
         await resources.client.interrupt()
     except Exception as exc:  # pragma: no cover - network failure
         LOGGER.exception("Failed to interrupt workflow")
+        _log_user_event(resources, user_id, "workflow_cancel_failed", workflow=user_data.get("workflow_name"), prompt_id=prompt_id, error=str(exc))
         await respond(
             message_source,
             f"⚠️ Не удалось остановить: <code>{escape(str(exc))}</code>",
@@ -2539,6 +2862,8 @@ async def cancel_workflow(message_source: MessageSource, context: ContextTypes.D
     task = ACTIVE_TASKS.get(user_id)
     if task and not task.done():
         task.cancel()
+
+    _log_user_event(resources, user_id, "workflow_cancel_dispatched", workflow=user_data.get("workflow_name"), prompt_id=prompt_id)
 
     await respond(
         message_source,
@@ -2561,6 +2886,8 @@ async def handle_execution_result(
     expected_outputs: Optional[int] = None
     preview_message_id: Optional[int] = None
     seed_overrides: Optional[Dict[str, Dict[str, Any]]] = None
+    duration_seconds: Optional[float] = None
+    workflow_name = str(user_data.get("workflow_name") or "default")
     if isinstance(run_state, dict):
         raw_expected = run_state.get("expected_outputs")
         if isinstance(raw_expected, int):
@@ -2571,13 +2898,31 @@ async def handle_execution_result(
         raw_seeds = run_state.get("seed_overrides")
         if isinstance(raw_seeds, dict):
             seed_overrides = raw_seeds
+        started_at = run_state.get("started_at_perf")
+        if isinstance(started_at, (int, float)):
+            try:
+                duration_seconds = max(0.0, time.perf_counter() - float(started_at))
+            except Exception:  # pragma: no cover - защита от неожиданного значения
+                duration_seconds = None
 
     if result.data.get("type") == "execution_error":
         error = result.data.get("data", {}).get("error", "Неизвестная ошибка")
+        _log_user_event(
+            resources,
+            user_id,
+            "workflow_failed",
+            workflow=workflow_name,
+            prompt_id=prompt_id,
+            error=str(error),
+            duration_s=duration_seconds,
+        )
         _log_history_entry(context, resources, user_id, prompt_id, status="error", error=str(error))
+        error_text = f"❌ Ошибка при выполнении:\n<code>{escape(str(error))}</code>"
+        if duration_seconds is not None:
+            error_text += f"\n⌛ Время до ошибки: {duration_seconds:.2f} с."
         edited = await edit_message(
             status_message,
-            f"❌ Ошибка при выполнении:\n<code>{escape(str(error))}</code>",
+            error_text,
         )
         if isinstance(edited, Message):
             status_message = edited
@@ -2593,13 +2938,13 @@ async def handle_execution_result(
                 LOGGER.debug("Failed to update preview caption on error", exc_info=True)
         notifications = _get_notification_settings(user_data)
         if notifications.get("failure", True):
-            workflow_name = user_data.get("workflow_name", "default")
             await context.bot.send_message(
                 chat_id=status_message.chat_id,
                 text=(
                     "🔔 Генерация завершилась ошибкой."
                     f"\nWorkflow: <code>{escape(str(workflow_name))}</code>"
                     f"\n<code>{escape(str(error))}</code>"
+                    + (f"\n⌛ Время до ошибки: {duration_seconds:.2f} с." if duration_seconds is not None else "")
                 ),
                 parse_mode=ParseMode.HTML,
             )
@@ -2612,10 +2957,20 @@ async def handle_execution_result(
     )
 
     if not outputs:
+        _log_user_event(
+            resources,
+            user_id,
+            "workflow_no_outputs",
+            workflow=workflow_name,
+            prompt_id=prompt_id,
+            duration_s=duration_seconds,
+        )
         _log_history_entry(context, resources, user_id, prompt_id, status="no_output")
         message_text = "⚠️ Выполнение завершено, но результаты не найдены."
         if expected_outputs:
             message_text += f"\nОжидалось изображений: {expected_outputs}."
+        if duration_seconds is not None:
+            message_text += f"\n⌛ Время генерации: {duration_seconds:.2f} с."
         edited = await edit_message(
             status_message,
             message_text,
@@ -2634,12 +2989,12 @@ async def handle_execution_result(
                 LOGGER.debug("Failed to update preview caption when outputs missing", exc_info=True)
         notifications = _get_notification_settings(user_data)
         if notifications.get("failure", True):
-            workflow_name = user_data.get("workflow_name", "default")
             await context.bot.send_message(
                 chat_id=status_message.chat_id,
                 text=(
                     "🔔 Генерация завершена без результатов."
                     f"\nWorkflow: <code>{escape(str(workflow_name))}</code>"
+                    + (f"\n⌛ Время генерации: {duration_seconds:.2f} с." if duration_seconds is not None else "")
                 ),
                 parse_mode=ParseMode.HTML,
             )
@@ -2744,6 +3099,8 @@ async def handle_execution_result(
         summary_text += f"\nОтправлено {len(files)} из ожидаемых {expected_outputs} изображений."
         if len(files) < expected_outputs:
             summary_text += " Проверьте каталог вывода ComfyUI."
+    if duration_seconds is not None:
+        summary_text += f"\n⌛ Время генерации: {duration_seconds:.2f} с."
 
     if seed_overrides:
         formatted = _format_seed_overrides(seed_overrides)
@@ -2778,13 +3135,25 @@ async def handle_execution_result(
         file_count=len(files),
     )
 
+    _log_user_event(
+        resources,
+        user_id,
+        "workflow_completed",
+        workflow=workflow_name,
+        prompt_id=prompt_id,
+        file_count=len(files),
+        files=[path.name for path in files],
+        duration_s=duration_seconds,
+    )
+
     notifications = _get_notification_settings(user_data)
     if notifications.get("success", True):
         note_lines = ["🔔 Генерация завершена успешно."]
         if files:
             note_lines.append(f"Файлов: {len(files)}")
-        workflow_name = user_data.get("workflow_name", "default")
         note_lines.append(f"Workflow: <code>{escape(str(workflow_name))}</code>")
+        if duration_seconds is not None:
+            note_lines.append(f"Время: {duration_seconds:.2f} с")
         await context.bot.send_message(
             chat_id=status_message.chat_id,
             text="\n".join(note_lines),
@@ -2799,6 +3168,8 @@ async def handle_execution_result(
         run_state.pop("shared_dirs", None)
         run_state.pop("shared_snapshot", None)
         run_state.pop("output_scan_started", None)
+        run_state.pop("started_at_perf", None)
+        run_state.pop("workflow_name", None)
 
 
 def _count_output_images(outputs: Dict[str, Any]) -> int:
@@ -4428,6 +4799,8 @@ async def ensure_workflow_loaded(
 
     name = get_user_data(context).get("workflow_name", "default")
     workflow = resources.storage.load_workflow(user_id, name)
+    if workflow is None:
+        workflow = resources.storage.ensure_default_workflow_for_user(user_id, name)
     if workflow is not None:
         get_user_data(context)["workflow"] = workflow
     return workflow
@@ -5851,6 +6224,7 @@ async def send_main_menu(update: MessageSource, context: ContextTypes.DEFAULT_TY
 
 def _menu_reply_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> ReplyKeyboardMarkup:
     resources = require_resources(context)
+    resources.storage.ensure_default_workflow_for_user(user_id)
     has_workflow = any(resources.storage.list_workflows(user_id))
 
     visible_actions: list[str] = []
@@ -6408,7 +6782,8 @@ def require_resources(context: ContextTypes.DEFAULT_TYPE) -> BotResources:
 
 def _build_resources() -> BotResources:
     config = load_config()
-    storage = WorkflowStorage(config.data_dir / "workflows")
+    _ensure_default_assets(config)
+    storage = WorkflowStorage(config.data_dir / "workflows", default_workflow_path=config.default_workflow_path)
     client = ComfyUIClient(
         config.comfyui_http_url,
         config.comfyui_ws_url,
@@ -6515,14 +6890,34 @@ def _configure_logging(config: BotConfig) -> None:
 
     logging.basicConfig(level=log_level, handlers=[console_handler], format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
-    log_file = os.getenv("LOG_FILE")
-    if not log_file:
-        log_file = str(config.data_dir / "bot.log")
+    log_dir_env = os.getenv("LOG_DIR")
+    log_dir = Path(log_dir_env).expanduser().resolve() if log_dir_env else (config.data_dir / "logs").resolve()
 
     try:
-        file_path = Path(log_file)
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:  # pragma: no cover - логирование не должно ломать бот
+        LOGGER.warning("Не удалось подготовить каталог логов: %s", log_dir, exc_info=True)
+
+    user_logs_dir = log_dir / "users"
+    try:
+        user_logs_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        LOGGER.debug("Не удалось подготовить каталог пользовательских логов: %s", user_logs_dir, exc_info=True)
+    else:
+        global USER_LOG_BASE_DIR
+        USER_LOG_BASE_DIR = user_logs_dir
+
+    log_file_env = os.getenv("LOG_FILE")
+    if log_file_env:
+        file_path = Path(log_file_env).expanduser()
+        if not file_path.is_absolute():
+            file_path = log_dir / file_path
+    else:
+        file_path = log_dir / "bot.log"
+
+    try:
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(file_path, mode="w", encoding="utf-8")
+        file_handler = logging.FileHandler(file_path, mode="a", encoding="utf-8")
         file_handler.setLevel(log_level)
         file_handler.setFormatter(formatter)
         logging.getLogger().addHandler(file_handler)
@@ -6534,8 +6929,13 @@ def _configure_logging(config: BotConfig) -> None:
 def main() -> None:
     config = load_config()
     _configure_logging(config)
-    storage = WorkflowStorage(config.data_dir / "workflows")
-    client = ComfyUIClient(config.comfyui_http_url, config.comfyui_ws_url)
+    _ensure_default_assets(config)
+    storage = WorkflowStorage(config.data_dir / "workflows", default_workflow_path=config.default_workflow_path)
+    client = ComfyUIClient(
+        config.comfyui_http_url,
+        config.comfyui_ws_url,
+        templates_dir=config.workflow_templates_dir,
+    )
     resources = BotResources(config=config, storage=storage, client=client)
 
     application = build_application(config, resources)

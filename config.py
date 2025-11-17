@@ -1,4 +1,5 @@
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -20,6 +21,7 @@ class BotConfig:
     persistence_path: Path
     restart_command: Optional[str] = None
     workflow_templates_dir: Optional[Path] = None
+    default_workflow_path: Optional[Path] = None
 
 
 def load_config() -> BotConfig:
@@ -40,9 +42,22 @@ def load_config() -> BotConfig:
 
     restart_cmd = os.getenv("COMFYUI_RESTART_CMD")
     templates_dir_env = os.getenv("COMFYUI_WORKFLOW_TEMPLATES_DIR")
-    templates_dir: Optional[Path] = None
+    default_workflow_env = os.getenv("DEFAULT_WORKFLOW_FILE")
+
     if templates_dir_env:
         templates_dir = Path(templates_dir_env).expanduser().resolve()
+    else:
+        templates_dir = (base_dir / "templates").resolve()
+
+    if default_workflow_env:
+        default_workflow_path = Path(default_workflow_env).expanduser().resolve()
+    else:
+        default_workflow_path = (base_dir / "workflows" / "default.json").resolve()
+
+    legacy_default = base_dir / "default.json"
+    if not default_workflow_path.exists() and legacy_default.exists():
+        default_workflow_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(legacy_default, default_workflow_path)
 
     config = BotConfig(
         bot_token=bot_token,
@@ -54,6 +69,7 @@ def load_config() -> BotConfig:
         persistence_path=base_dir / persistence_name,
         restart_command=restart_cmd,
         workflow_templates_dir=templates_dir,
+        default_workflow_path=default_workflow_path,
     )
 
     ensure_directories(config)
@@ -68,3 +84,7 @@ def ensure_directories(config: BotConfig) -> None:
     except OSError:
         # Shared directories may live on removable drives managed outside the bot
         pass
+    if config.workflow_templates_dir:
+        config.workflow_templates_dir.mkdir(parents=True, exist_ok=True)
+    if config.default_workflow_path:
+        config.default_workflow_path.parent.mkdir(parents=True, exist_ok=True)
