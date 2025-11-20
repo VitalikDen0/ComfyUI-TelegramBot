@@ -147,6 +147,7 @@ MODEL_PARAM_TYPE_BY_NODE: Dict[tuple[str, str], str] = {
     ("IPAdapterLoader", "ip_adapter_name"): "ipadapter",
     ("HypernetworkLoader", "hypernetwork_name"): "hypernetworks",
     ("TextualInversionLoader", "embedding_name"): "embeddings",
+    ("UpscaleModelLoader", "model_name"): "upscale_models",
 }
 
 GENERIC_MODEL_PARAM_TYPES: Dict[str, str] = {

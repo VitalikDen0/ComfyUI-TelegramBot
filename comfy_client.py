@@ -42,7 +42,7 @@ class ExecutionResult:
 class ComfyUIClient:
     """Async client for ComfyUI REST and WebSocket APIs."""
 
-    _MODEL_EXTENSIONS: tuple[str, ...] = (".safetensors", ".ckpt", ".pth", ".gguf")
+    _MODEL_EXTENSIONS: tuple[str, ...] = (".safetensors", ".ckpt", ".pth", ".pt", ".onnx", ".gguf")
 
     def __init__(
         self,
@@ -500,8 +500,109 @@ class ComfyUIClient:
 
                 filtered = self._filter_model_names(alt_names)
 
+        if not filtered:
+            filtered = await self._list_special_models(model_type)
+
         self._model_cache[key] = filtered
         return filtered
+
+    async def _list_special_models(self, model_type: Optional[str]) -> List[str]:
+        normalized = (model_type or "").lower()
+        if normalized in {"upscale", "upscale_model", "upscale_models"}:
+            return self._filter_model_names(await self._list_upscale_models_from_object_info())
+        return []
+
+    async def _list_upscale_models_from_object_info(self) -> List[str]:
+        try:
+            object_info = await self.get_object_info()
+        except Exception:
+            LOGGER.debug("Не удалось получить object_info для списка апскейл моделей", exc_info=True)
+            return []
+
+        nodes = object_info.get("nodes")
+        if not isinstance(nodes, dict):
+            return []
+
+        candidates: List[str] = []
+        for node_key, node_data in nodes.items():
+            node_name = str(node_key) if node_key is not None else ""
+            if not node_name.endswith("UpscaleModelLoader"):
+                continue
+            if not isinstance(node_data, dict):
+                continue
+            spec = self._extract_model_spec(node_data, "model_name")
+            if spec is None:
+                continue
+            options = self._coerce_spec_options(spec)
+            if options:
+                candidates.extend(options)
+
+        unique: List[str] = []
+        seen: set[str] = set()
+        for name in candidates:
+            if not isinstance(name, str):
+                continue
+            trimmed = name.strip()
+            if not trimmed:
+                continue
+            lowered = trimmed.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            unique.append(trimmed)
+
+        unique.sort(key=lambda value: value.lower())
+        return unique
+
+    @staticmethod
+    def _extract_model_spec(node_data: Dict[str, Any], parameter: str) -> Any:
+        inputs = node_data.get("input") or node_data.get("inputs")
+        if isinstance(inputs, dict):
+            for section in ("required", "optional", "inputs"):
+                section_data = inputs.get(section)
+                if isinstance(section_data, dict) and parameter in section_data:
+                    return section_data.get(parameter)
+            if parameter in inputs:
+                return inputs.get(parameter)
+        return None
+
+    @staticmethod
+    def _coerce_spec_options(spec: Any) -> List[str]:
+        meta: Optional[Dict[str, Any]] = None
+        if isinstance(spec, dict):
+            meta = spec
+        elif isinstance(spec, list) and len(spec) > 1 and isinstance(spec[1], dict):
+            meta = spec[1]
+        if not isinstance(meta, dict):
+            return []
+
+        raw_options = meta.get("options") or meta.get("enum") or meta.get("choices")
+        values: List[str] = []
+        data = raw_options
+        if isinstance(data, dict):
+            data = list(data.values())
+        if not isinstance(data, (list, tuple)):
+            data = [data] if isinstance(data, str) else []
+
+        for item in data:
+            value: Any
+            if isinstance(item, (list, tuple)):
+                length = len(item)
+                if length == 0:
+                    continue
+                if length >= 2:
+                    value = item[1]
+                else:
+                    value = item[0]
+            elif isinstance(item, dict):
+                value = item.get("value") or item.get("name") or item.get("id") or item.get("label")
+            else:
+                value = item
+            if isinstance(value, str):
+                trimmed = value.strip()
+                if trimmed:
+                    values.append(trimmed)
+        return values
 
     async def submit_workflow(self, workflow: Dict, *, client_id: Optional[str] = None) -> tuple[str, str]:
         client_id = client_id or str(uuid.uuid4())
