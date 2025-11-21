@@ -240,6 +240,10 @@ async def _dispatch_dynamic_action(
         _, node_id, parameter, index = action
         await apply_quick_param_choice(source, context, str(node_id), str(parameter), int(index))
         return True
+    if kind == "param_page":
+        _, node_id, parameter, page = action
+        await show_param_choice_page(source, context, str(node_id), str(parameter), int(page))
+        return True
     if kind == "conn_input":
         _, node_id, input_name = action
         await start_connection_selection(source, context, str(node_id), str(input_name))
@@ -4468,6 +4472,10 @@ async def _collect_param_choices(
     if static_choices:
         return static_choices
 
+    ksampler_choices = await _build_ksampler_param_choices(context, node, parameter, current_value)
+    if ksampler_choices:
+        return ksampler_choices
+
     dynamic_choices = await _build_dynamic_model_choices(context, node, parameter, current_value)
     if dynamic_choices:
         return dynamic_choices
@@ -4536,6 +4544,58 @@ def _model_choices_from_names(models: Iterable[str], current_value: Any) -> list
         choices.append({"label": label, "value": trimmed})
 
     return choices
+
+
+def _enum_choices_from_strings(values: Iterable[str], current_value: Any) -> list[Dict[str, Any]]:
+    normalized_current = str(current_value).strip().lower() if isinstance(current_value, str) else None
+    choices: list[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        trimmed = value.strip()
+        if not trimmed:
+            continue
+        lowered = trimmed.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        label = trimmed
+        if normalized_current and normalized_current == lowered:
+            label = f"✅ {trimmed}"
+        choices.append({"label": label, "value": trimmed})
+
+    return choices
+
+
+async def _build_ksampler_param_choices(
+    context: ContextTypes.DEFAULT_TYPE,
+    node: Dict[str, Any],
+    parameter: str,
+    current_value: Any,
+) -> list[Dict[str, Any]]:
+    node_type = str(node.get("class_type") or node.get("type") or "")
+    if "KSampler" not in node_type:
+        return []
+
+    resources = require_resources(context)
+
+    try:
+        if parameter == "sampler_name":
+            values = await resources.client.list_samplers(refresh=True)
+        elif parameter == "scheduler":
+            values = await resources.client.list_schedulers(refresh=True)
+        else:
+            return []
+    except Exception:  # pragma: no cover - best effort helper
+        LOGGER.warning("Не удалось получить варианты для параметра %s", parameter, exc_info=True)
+        return []
+
+    if not values:
+        return []
+
+    return _enum_choices_from_strings(values, current_value)
 
 
 async def _set_node_parameter_value(
@@ -4641,7 +4701,23 @@ async def _show_param_choices_page(
     page: int,
 ) -> None:
     total = len(all_choices)
-    total_pages = (total + PARAM_CHOICES_PAGE_SIZE - 1) // PARAM_CHOICES_PAGE_SIZE
+    if total == 0:
+        mapping: dict[str, ButtonAction] = {}
+        cancel_label = "❎ Отменить"
+        mapping[cancel_label] = ("cancel_input",)
+        manual_label = "✏️ Ввести вручную"
+        mapping[manual_label] = ("param_manual", node_id, parameter)
+        rows = [[manual_label], [cancel_label]]
+        _set_dynamic_buttons(context, mapping)
+        await respond(
+            source,
+            "⚠️ Подходящих значений не найдено. Можно ввести вручную или отменить.",
+            ReplyKeyboardMarkup(rows, resize_keyboard=True),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    total_pages = (total + PARAM_CHOICES_PAGE_SIZE - 1) // PARAM_CHOICES_PAGE_SIZE or 1
     page = max(0, min(page, total_pages - 1))
 
     choices_state = get_user_data(context).get("pending_input_choices")
@@ -4649,34 +4725,62 @@ async def _show_param_choices_page(
         choices_state["page"] = page
 
     start = page * PARAM_CHOICES_PAGE_SIZE
-    end = start + PARAM_CHOICES_PAGE_SIZE
+    end = min(start + PARAM_CHOICES_PAGE_SIZE, total)
     page_choices = all_choices[start:end]
+
+    mapping: dict[str, ButtonAction] = {}
+    rows: list[list[str]] = []
+    current_row: list[str] = []
+
+    for idx, choice in enumerate(page_choices):
+        global_idx = start + idx
+        label_text = choice["label"]
+        numbered_label = f"{global_idx + 1}. {label_text}"
+        current_row.append(numbered_label)
+        mapping[numbered_label] = ("param_quick", node_id, parameter, global_idx)
+        if len(current_row) == 2:
+            rows.append(current_row)
+            current_row = []
+
+    if current_row:
+        rows.append(current_row)
+
+    nav_row: list[str] = []
+    if page > 0:
+        prev_label = "⬅️ Предыдущая"
+        nav_row.append(prev_label)
+        mapping[prev_label] = ("param_page", node_id, parameter, page - 1)
+    if page < total_pages - 1:
+        next_label = "➡️ Следующая"
+        nav_row.append(next_label)
+        mapping[next_label] = ("param_page", node_id, parameter, page + 1)
+    if nav_row:
+        rows.append(nav_row)
+
+    manual_label = "✏️ Ввести вручную"
+    rows.append([manual_label])
+    mapping[manual_label] = ("param_manual", node_id, parameter)
+
+    cancel_label = "❎ Отменить"
+    rows.append([cancel_label])
+    mapping[cancel_label] = ("cancel_input",)
+
+    _set_dynamic_buttons(context, mapping)
 
     text_lines = [
         f"✏️ Выберите значение для <b>{escape(parameter)}</b>",
         f"Текущее: <code>{escape(repr(current_value))}</code>",
+        f"Показываю {start + 1}–{end} из {total}",
         f"Страница {page + 1}/{total_pages}",
+        "Можно нажать кнопку или ввести текст вручную.",
     ]
 
-    buttons: list[list[InlineKeyboardButton]] = []
-    for idx, choice in enumerate(page_choices):
-        global_idx = start + idx
-        label = choice["label"]
-        buttons.append([InlineKeyboardButton(label, callback_data=f"{WORKFLOW_PARAM_QUICK_PREFIX}{node_id}:{parameter}:{global_idx}")])
-
-    nav_row: list[InlineKeyboardButton] = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"{WORKFLOW_PARAM_PAGE_PREFIX}{node_id}:{parameter}:{page - 1}"))
-    if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton("Вперёд ➡️", callback_data=f"{WORKFLOW_PARAM_PAGE_PREFIX}{node_id}:{parameter}:{page + 1}"))
-    if nav_row:
-        buttons.append(nav_row)
-
-    buttons.append([InlineKeyboardButton("✏️ Ввести вручную", callback_data=f"param:manual:{node_id}:{parameter}")])
-    buttons.append([InlineKeyboardButton("❎ Отменить", callback_data="param:cancel")])
-
-    markup = InlineKeyboardMarkup(buttons)
-    await respond(source, "\n".join(text_lines), markup, parse_mode=ParseMode.HTML, edit=isinstance(source, CallbackQuery))
+    await respond(
+        source,
+        "\n".join(text_lines),
+        ReplyKeyboardMarkup(rows, resize_keyboard=True),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def prompt_manual_param_input(

@@ -7,7 +7,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote, urlparse, urlunparse
 
 import aiohttp
@@ -61,6 +61,7 @@ class ComfyUIClient:
         self._object_info_cache: Optional[Dict] = None
         self._template_cache: Optional[List[Dict[str, Any]]] = None
         self._model_cache: Dict[str, List[str]] = {}
+        self._enum_cache: Dict[str, List[str]] = {}
         self._endpoint_ready = False
         self._endpoint_lock = asyncio.Lock()
         self._templates_dir = templates_dir
@@ -84,6 +85,8 @@ class ComfyUIClient:
             self._template_cache = None
         if not hasattr(self, "_model_cache"):
             self._model_cache = {}
+        if not hasattr(self, "_enum_cache"):
+            self._enum_cache = {}
         if not hasattr(self, "_templates_dir"):
             self._templates_dir = None
 
@@ -553,6 +556,156 @@ class ComfyUIClient:
 
         unique.sort(key=lambda value: value.lower())
         return unique
+
+    async def list_samplers(self, refresh: bool = False) -> List[str]:
+        return await self._list_enum_values("samplers", self._fetch_samplers, refresh)
+
+    async def list_schedulers(self, refresh: bool = False) -> List[str]:
+        return await self._list_enum_values("schedulers", self._fetch_schedulers, refresh)
+
+    async def _list_enum_values(
+        self,
+        cache_key: str,
+        fetcher: Callable[[], Awaitable[List[str]]],
+        refresh: bool,
+    ) -> List[str]:
+        key = (cache_key or "").lower()
+        if not refresh and key in self._enum_cache:
+            return self._enum_cache.get(key, [])
+
+        try:
+            values = await fetcher()
+        except Exception:
+            LOGGER.warning("Не удалось получить список %s", cache_key, exc_info=True)
+            values = []
+
+        normalized = self._normalize_enumeration(values)
+        self._enum_cache[key] = normalized
+        return normalized
+
+    async def _fetch_samplers(self) -> List[str]:
+        async with self._request("GET", "/samplers") as resp:
+            status = resp.status
+            reason = resp.reason or ""
+            text = await resp.text()
+
+        if status == 404:
+            LOGGER.debug("ComfyUI не поддерживает /samplers")
+            return await self._list_ksampler_options_from_object_info("sampler_name")
+
+        if status >= 400:
+            detail = text.strip() or reason or str(status)
+            raise RuntimeError(f"HTTP {status} при запросе списка сэмплеров: {detail}")
+
+        payload: Any
+        try:
+            payload = json.loads(text or "[]")
+        except json.JSONDecodeError:
+            payload = [line.strip() for line in text.splitlines() if line.strip()]
+
+        names = self._coerce_name_list(payload)
+        if not names:
+            names = await self._list_ksampler_options_from_object_info("sampler_name")
+        return names
+
+    async def _fetch_schedulers(self) -> List[str]:
+        async with self._request("GET", "/schedulers") as resp:
+            status = resp.status
+            reason = resp.reason or ""
+            text = await resp.text()
+
+        if status == 404:
+            LOGGER.debug("ComfyUI не поддерживает /schedulers")
+            return await self._list_ksampler_options_from_object_info("scheduler")
+
+        if status >= 400:
+            detail = text.strip() or reason or str(status)
+            raise RuntimeError(f"HTTP {status} при запросе списка планировщиков: {detail}")
+
+        payload: Any
+        try:
+            payload = json.loads(text or "[]")
+        except json.JSONDecodeError:
+            payload = [line.strip() for line in text.splitlines() if line.strip()]
+
+        names = self._coerce_name_list(payload)
+        if not names:
+            names = await self._list_ksampler_options_from_object_info("scheduler")
+        return names
+
+    async def _list_ksampler_options_from_object_info(self, parameter: str) -> List[str]:
+        try:
+            object_info = await self.get_object_info()
+        except Exception:
+            LOGGER.debug("Не удалось получить object_info для параметра %s", parameter, exc_info=True)
+            return []
+
+        nodes = object_info.get("nodes")
+        if not isinstance(nodes, dict):
+            return []
+
+        candidates: List[str] = []
+        for node_key, node_data in nodes.items():
+            node_name = str(node_key) if node_key is not None else ""
+            if "KSampler" not in node_name:
+                continue
+            if not isinstance(node_data, dict):
+                continue
+            spec = self._extract_model_spec(node_data, parameter)
+            if spec is None:
+                continue
+            options = self._coerce_spec_options(spec)
+            if options:
+                candidates.extend(options)
+
+        return self._normalize_enumeration(candidates)
+
+    @staticmethod
+    def _coerce_name_list(payload: Any) -> List[str]:
+        names: List[str] = []
+        stack: List[Any] = [payload]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, str):
+                names.append(current)
+                continue
+            if isinstance(current, dict):
+                for key in ("name", "title", "value", "id", "label"):
+                    candidate = current.get(key)
+                    if isinstance(candidate, str):
+                        names.append(candidate)
+                for value in current.values():
+                    if isinstance(value, (list, tuple)):
+                        stack.extend(list(value))
+                    elif isinstance(value, dict):
+                        stack.append(value)
+                    elif isinstance(value, str):
+                        names.append(value)
+                for key in current.keys():
+                    if isinstance(key, str):
+                        names.append(key)
+                continue
+            if isinstance(current, (list, tuple)):
+                stack.extend(list(current))
+        return names
+
+    @staticmethod
+    def _normalize_enumeration(values: Iterable[str]) -> List[str]:
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            trimmed = value.strip()
+            if not trimmed:
+                continue
+            lowered = trimmed.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            normalized.append(trimmed)
+        normalized.sort(key=lambda item: item.lower())
+        return normalized
 
     @staticmethod
     def _extract_model_spec(node_data: Dict[str, Any], parameter: str) -> Any:
