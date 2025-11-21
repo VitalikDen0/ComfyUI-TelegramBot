@@ -522,8 +522,8 @@ class ComfyUIClient:
             LOGGER.debug("Не удалось получить object_info для списка апскейл моделей", exc_info=True)
             return []
 
-        nodes = object_info.get("nodes")
-        if not isinstance(nodes, dict):
+        nodes = self._extract_object_info_nodes(object_info)
+        if not nodes:
             return []
 
         candidates: List[str] = []
@@ -640,8 +640,8 @@ class ComfyUIClient:
             LOGGER.debug("Не удалось получить object_info для параметра %s", parameter, exc_info=True)
             return []
 
-        nodes = object_info.get("nodes")
-        if not isinstance(nodes, dict):
+        nodes = self._extract_object_info_nodes(object_info)
+        if not nodes:
             return []
 
         candidates: List[str] = []
@@ -720,14 +720,59 @@ class ComfyUIClient:
         return None
 
     @staticmethod
+    def _extract_object_info_nodes(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return {}
+
+        nodes = payload.get("nodes")
+        if isinstance(nodes, dict) and nodes:
+            return nodes
+
+        candidates: Dict[str, Dict[str, Any]] = {}
+        for key, value in payload.items():
+            if not isinstance(value, dict):
+                continue
+            if any(isinstance(value.get(field), (dict, list)) for field in ("input", "inputs")):
+                candidates[str(key)] = value
+                continue
+            if any(field in value for field in ("input", "inputs", "output", "outputs", "category")):
+                candidates[str(key)] = value
+
+        return candidates
+
+    @staticmethod
     def _coerce_spec_options(spec: Any) -> List[str]:
         meta: Optional[Dict[str, Any]] = None
+        collected: List[str] = []
         if isinstance(spec, dict):
             meta = spec
         elif isinstance(spec, list) and len(spec) > 1 and isinstance(spec[1], dict):
             meta = spec[1]
+            head = spec[0]
+            if isinstance(head, (list, tuple)):
+                for item in head:
+                    if isinstance(item, str):
+                        trimmed = item.strip()
+                        if trimmed:
+                            collected.append(trimmed)
+            elif isinstance(head, dict):
+                collected.extend(
+                    str(value).strip()
+                    for value in head.values()
+                    if isinstance(value, str) and value.strip()
+                )
+            elif isinstance(head, str):
+                trimmed = head.strip()
+                if trimmed:
+                    collected.append(trimmed)
+        elif isinstance(spec, list) and spec and isinstance(spec[0], (list, tuple, set)):
+            for item in spec[0]:
+                if isinstance(item, str):
+                    trimmed = item.strip()
+                    if trimmed:
+                        collected.append(trimmed)
         if not isinstance(meta, dict):
-            return []
+            return collected
 
         raw_options = meta.get("options") or meta.get("enum") or meta.get("choices")
         values: List[str] = []
@@ -755,7 +800,9 @@ class ComfyUIClient:
                 trimmed = value.strip()
                 if trimmed:
                     values.append(trimmed)
-        return values
+        if values:
+            return values
+        return collected
 
     async def submit_workflow(self, workflow: Dict, *, client_id: Optional[str] = None) -> tuple[str, str]:
         client_id = client_id or str(uuid.uuid4())
