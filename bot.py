@@ -2539,6 +2539,22 @@ async def launch_workflow(message_source: MessageSource, context: ContextTypes.D
         )
         return
 
+    enum_errors = await _collect_enum_validation_errors(resources, workflow)
+    if enum_errors:
+        preview = enum_errors[:10]
+        lines = ["<b>⚠️ Найдены недопустимые значения параметров</b>", ""]
+        lines.extend(preview)
+        if len(enum_errors) > len(preview):
+            lines.append(f"• … и ещё {len(enum_errors) - len(preview)} параметров")
+        lines.append("Исправьте значения в редакторе нод и повторите запуск.")
+        await respond(
+            message_source,
+            "\n".join(lines),
+            _workflow_markup_for_source(context, message_source, user_id),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     workflow_name = str(user_data.get("workflow_name") or "default")
     _persist_workflow(resources, user_id, workflow, workflow_name)
     await _flush_persistence(context)
@@ -4306,7 +4322,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await message.reply_text(f"⚠️ {exc}")
             return
 
-        await _set_node_parameter_value(message, context, node_id, parameter, converted)
+        try:
+            resolved_value = _resolve_choice_value(context, node_id, parameter, converted)
+        except ValueError as exc:
+            await message.reply_text(f"⚠️ {exc}")
+            return
+
+        await _set_node_parameter_value(message, context, node_id, parameter, resolved_value)
         return
 
     if user_data.get("awaiting_catalog_search"):
@@ -4567,6 +4589,145 @@ def _enum_choices_from_strings(values: Iterable[str], current_value: Any) -> lis
         choices.append({"label": label, "value": trimmed})
 
     return choices
+
+
+_CHOICE_LABEL_PREFIXES: tuple[str, ...] = ("✅", "✖️", "✔️", "✕", "❌")
+
+
+def _normalize_choice_text(text: str) -> str:
+    cleaned = text.strip()
+    for prefix in _CHOICE_LABEL_PREFIXES:
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :].lstrip()
+            break
+    return cleaned.lower()
+
+
+def _resolve_choice_value(
+    context: ContextTypes.DEFAULT_TYPE,
+    node_id: str,
+    parameter: str,
+    value: Any,
+) -> Any:
+    choices_state = get_user_data(context).get("pending_input_choices")
+    if not isinstance(choices_state, dict):
+        return value
+    if choices_state.get("node_id") != node_id or choices_state.get("parameter") != parameter:
+        return value
+
+    all_choices = choices_state.get("choices")
+    if not isinstance(all_choices, list) or not all_choices:
+        return value
+
+    if isinstance(value, str):
+        normalized = _normalize_choice_text(value)
+        numeric_candidate = normalized.rstrip(".)")
+        if numeric_candidate.isdigit():
+            index = int(numeric_candidate) - 1
+            if 0 <= index < len(all_choices):
+                candidate_value = all_choices[index].get("value")
+                if candidate_value is not None:
+                    return candidate_value
+
+        for choice in all_choices:
+            candidate_value = choice.get("value")
+            if isinstance(candidate_value, str) and _normalize_choice_text(candidate_value) == normalized:
+                return candidate_value
+
+        for choice in all_choices:
+            label = choice.get("label")
+            if isinstance(label, str) and _normalize_choice_text(label) == normalized:
+                candidate_value = choice.get("value")
+                if candidate_value is not None:
+                    return candidate_value
+
+        raise ValueError(
+            "Это значение отсутствует в списке. Выберите вариант кнопкой или введите одно из предложенных значений."
+        )
+
+    for choice in all_choices:
+        candidate_value = choice.get("value")
+        if value == candidate_value:
+            return candidate_value
+
+    return value
+
+
+async def _collect_enum_validation_errors(resources: BotResources, workflow: Dict[str, Any]) -> list[str]:
+    nodes = workflow.get("nodes")
+    if isinstance(nodes, dict):
+        items = list(nodes.items())
+    elif isinstance(nodes, list):
+        items = [(str(node.get("id")), node) for node in nodes if isinstance(node, dict)]
+    else:
+        return []
+
+    sampler_options: Optional[set[str]] = None
+    scheduler_options: Optional[set[str]] = None
+
+    errors: list[str] = []
+
+    async def _ensure_sampler_options() -> set[str]:
+        nonlocal sampler_options
+        if sampler_options is None:
+            try:
+                samplers = await resources.client.list_samplers()
+            except Exception:  # pragma: no cover - best effort
+                LOGGER.warning("Не удалось получить список sampler_name", exc_info=True)
+                sampler_options = set()
+            else:
+                sampler_options = {
+                    item.strip().lower()
+                    for item in samplers
+                    if isinstance(item, str) and item.strip()
+                }
+        return sampler_options or set()
+
+    async def _ensure_scheduler_options() -> set[str]:
+        nonlocal scheduler_options
+        if scheduler_options is None:
+            try:
+                schedulers = await resources.client.list_schedulers()
+            except Exception:  # pragma: no cover - best effort
+                LOGGER.warning("Не удалось получить список scheduler", exc_info=True)
+                scheduler_options = set()
+            else:
+                scheduler_options = {
+                    item.strip().lower()
+                    for item in schedulers
+                    if isinstance(item, str) and item.strip()
+                }
+        return scheduler_options or set()
+
+    for node_id, node in items:
+        if not isinstance(node, dict):
+            continue
+        node_type = str(node.get("class_type") or node.get("type") or "")
+        if "KSampler" not in node_type:
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+
+        sampler_value = inputs.get("sampler_name")
+        if isinstance(sampler_value, str):
+            allowed = await _ensure_sampler_options()
+            if allowed and sampler_value.strip().lower() not in allowed:
+                errors.append(
+                    f"Нода #{escape(str(node_id))}: параметр <code>sampler_name</code> имеет недопустимое значение "
+                    f"<code>{escape(sampler_value)}</code>."
+                )
+
+        scheduler_value = inputs.get("scheduler")
+        if isinstance(scheduler_value, str):
+            allowed_sched = await _ensure_scheduler_options()
+            if allowed_sched and scheduler_value.strip().lower() not in allowed_sched:
+                errors.append(
+                    f"Нода #{escape(str(node_id))}: параметр <code>scheduler</code> имеет недопустимое значение "
+                    f"<code>{escape(scheduler_value)}</code>."
+                )
+
+    return errors
 
 
 async def _build_ksampler_param_choices(

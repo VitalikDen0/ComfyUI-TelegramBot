@@ -1102,7 +1102,11 @@ class ComfyUIClient:
 
         urls.append(_compose(parsed.port or self._auto_port))
 
-        for port in range(8000, 8011):
+        default_ports = list(range(8000, 8011))
+        if 8188 not in default_ports:
+            default_ports.append(8188)
+
+        for port in default_ports:
             candidate = _compose(port)
             if candidate not in urls:
                 urls.append(candidate)
