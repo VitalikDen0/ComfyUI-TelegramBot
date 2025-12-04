@@ -31,6 +31,7 @@ from telegram.ext import (
 )
 
 from comfy_client import ComfyUIClient, ExecutionResult, PreviewPayload, ProgressEvent, gather_outputs
+from comfy_manager import ComfyProcessManager
 from config import BotConfig, load_config
 from storage import WorkflowStorage, get_user_id
 from workflow_render import format_workflow_summary
@@ -617,6 +618,7 @@ class BotResources:
     config: BotConfig
     storage: WorkflowStorage
     client: ComfyUIClient
+    process_manager: ComfyProcessManager
 
     async def shutdown(self) -> None:
         await self.client.close()
@@ -1109,12 +1111,50 @@ async def show_workflow_overview(
     _clear_dynamic_buttons(context)
     await _ensure_keyboard_mode(message_source, context, user_id, "workflow")
 
-    await respond(
-        message_source,
-        summary,
-        _workflow_markup_for_source(context, message_source, user_id),
-        parse_mode=ParseMode.HTML,
-    )
+    chunks = _split_summary_chunks(summary)
+    markup = _workflow_markup_for_source(context, message_source, user_id)
+    for chunk in chunks[:-1]:
+        await respond(message_source, chunk, parse_mode=ParseMode.HTML)
+    await respond(message_source, chunks[-1], markup, parse_mode=ParseMode.HTML)
+
+
+def _split_summary_chunks(text: str) -> list[str]:
+    limit = 3800
+    if not text:
+        return [""]
+
+    lines = text.split("\n")
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    def _flush_current() -> None:
+        nonlocal current, current_len
+        if current:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+
+    for raw_line in lines:
+        if not raw_line:
+            candidate = ""
+            line_segments = [candidate]
+        elif len(raw_line) <= limit:
+            line_segments = [raw_line]
+        else:
+            line_segments = [raw_line[i : i + limit] for i in range(0, len(raw_line), limit)]
+
+        for segment in line_segments:
+            target_len = len(segment)
+            extra = 1 if current else 0
+            if target_len + current_len + extra > limit:
+                _flush_current()
+                extra = 0
+            current.append(segment)
+            current_len += target_len + extra
+
+    _flush_current()
+    return chunks or [""]
 
 
 async def ensure_catalog(context: ContextTypes.DEFAULT_TYPE, *, refresh: bool = False) -> Dict[str, Any]:
@@ -2468,19 +2508,9 @@ async def interrupt_queue(message_source: MessageSource, context: ContextTypes.D
 async def restart_comfyui(message_source: MessageSource, context: ContextTypes.DEFAULT_TYPE) -> None:
     resources = require_resources(context)
     user_id = get_user_id_from_source(message_source)
-    command = resources.config.restart_command
-
+    
     _clear_dynamic_buttons(context)
     await _ensure_keyboard_mode(message_source, context, user_id, "menu")
-
-    if not command:
-        await respond(
-            message_source,
-            "⚙️ Команда перезапуска не настроена. Укажите COMFYUI_RESTART_CMD в .env.",
-            _menu_reply_keyboard(context, user_id),
-            parse_mode=ParseMode.HTML,
-        )
-        return
 
     await respond(
         message_source,
@@ -2490,8 +2520,14 @@ async def restart_comfyui(message_source: MessageSource, context: ContextTypes.D
     )
 
     async def _restart() -> None:
-        code = await resources.client.restart(command)
-        status_text = "✅ ComfyUI перезапущен." if code == 0 else f"⚠️ Перезапуск завершился с кодом {code}."
+        try:
+            await resources.process_manager.restart()
+            await asyncio.sleep(5) # Wait for startup
+            status_text = "✅ ComfyUI перезапущен."
+        except Exception as e:
+            LOGGER.error("Restart failed", exc_info=True)
+            status_text = f"⚠️ Ошибка перезапуска: {e}"
+            
         await respond(message_source, status_text, _menu_reply_keyboard(context, user_id), parse_mode=ParseMode.HTML)
 
     asyncio.create_task(_restart())
@@ -2579,11 +2615,32 @@ async def launch_workflow(message_source: MessageSource, context: ContextTypes.D
         return
 
     validation_errors, validation_warnings = validate_workflow(workflow, catalog)
+    catalog_refreshed = False
+    catalog_refresh_error: Optional[str] = None
+    if validation_errors and _should_refresh_catalog_for_errors(validation_errors):
+        try:
+            catalog = await ensure_catalog(context, refresh=True)
+        except Exception as exc:  # pragma: no cover - rare network failure
+            catalog_refresh_error = str(exc)
+            LOGGER.warning(
+                "Failed to refresh catalog before validating workflow for user_id=%s: %s",
+                user_id,
+                exc,
+            )
+        else:
+            catalog_refreshed = True
+            LOGGER.debug("Catalog refreshed before validation for user_id=%s", user_id)
+            validation_errors, validation_warnings = validate_workflow(workflow, catalog)
+
     if validation_errors:
         lines = ["<b>⚠️ Workflow не готов к запуску</b>", ""]
         lines.extend(f"• {escape(err)}" for err in validation_errors[:10])
         if len(validation_errors) > 10:
             lines.append(f"• … и ещё {len(validation_errors) - 10} ошибок")
+        if catalog_refresh_error:
+            lines.append(f"<i>Не удалось обновить каталог: {escape(catalog_refresh_error)}</i>")
+        elif catalog_refreshed:
+            lines.append("<i>Каталог обновлён, но ошибки остались.</i>")
         await respond(
             message_source,
             "\n".join(lines),
@@ -5592,7 +5649,13 @@ _PARAM_SPEC_HINT_KEYS = {
     "label",
 }
 
-_UI_ONLY_NODE_TYPES = {"MarkdownNote", "Note"}
+_UI_ONLY_NODE_TYPES = {
+    "MarkdownNote",
+    "Note",
+    "Reroute",
+    "PrimitiveNode",
+    "15655660-d18d-44a5-a55e-9fc16678a47a",  # Unknown UUID node, likely group/virtual
+}
 
 
 def _iter_input_items(mapping: Any, *, group: Optional[str] = None) -> Iterable[tuple[str, Any, Optional[str]]]:
@@ -6436,6 +6499,15 @@ def validate_workflow(workflow: Dict[str, Any], catalog: Dict[str, Any]) -> tupl
     return errors, warnings
 
 
+_MISSING_CATALOG_NODE_PHRASE = "отсутствует в установленном ComfyUI"
+
+
+def _should_refresh_catalog_for_errors(errors: list[str]) -> bool:
+    if not errors:
+        return False
+    return any(_MISSING_CATALOG_NODE_PHRASE in err for err in errors)
+
+
 def _iter_workflow_nodes(workflow: Dict[str, Any]) -> list[tuple[str, Any]]:
     nodes = workflow.get("nodes")
     result: list[tuple[str, Any]] = []
@@ -6580,6 +6652,10 @@ async def _dispatch_menu_action(
 
     if action == MENU_HISTORY:
         await show_history(message_source, context)
+        return True
+
+    if action == MENU_RESTART:
+        await restart_comfyui(message_source, context)
         return True
 
     if action == MENU_RESTART:
@@ -7035,14 +7111,19 @@ def get_node_ids(workflow: Dict[str, Any]) -> list[str]:
 
 
 def require_resources(context: ContextTypes.DEFAULT_TYPE) -> BotResources:
+    # Try to get from application attribute first (preferred, not persisted)
+    if hasattr(context.application, "resources"):
+        return context.application.resources # type: ignore
+
+    # Fallback to bot_data (legacy/persisted, but causes pickle issues with async clients)
     stored = context.application.bot_data.get("resources")
     if isinstance(stored, BotResources):
         return stored
 
     LOGGER.warning("Bot resources not pre-initialized; creating on-demand instance")
     resources = _build_resources()
-    context.application.bot_data["resources"] = resources
-
+    # Store in application attribute to avoid persistence pickling errors
+    context.application.resources = resources # type: ignore
     return resources
 
 
@@ -7055,7 +7136,8 @@ def _build_resources() -> BotResources:
         config.comfyui_ws_url,
         templates_dir=config.workflow_templates_dir,
     )
-    return BotResources(config=config, storage=storage, client=client)
+    process_manager = ComfyProcessManager(config)
+    return BotResources(config=config, storage=storage, client=client, process_manager=process_manager)
 
 
 def get_user_id_from_source(source: Message | Update | CallbackQuery) -> int:
@@ -7135,7 +7217,9 @@ def build_application(config: BotConfig, resources: BotResources) -> Application
         .build()
     )
 
-    application.bot_data["resources"] = resources
+    # Store resources in application attribute to avoid persistence pickling errors
+    application.resources = resources # type: ignore
+    # application.bot_data["resources"] = resources # REMOVED to fix pickle error
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(handle_menu_callback))
@@ -7202,7 +7286,17 @@ def main() -> None:
         config.comfyui_ws_url,
         templates_dir=config.workflow_templates_dir,
     )
-    resources = BotResources(config=config, storage=storage, client=client)
+    process_manager = ComfyProcessManager(config)
+    resources = BotResources(config=config, storage=storage, client=client, process_manager=process_manager)
+
+    # Auto-start ComfyUI logic
+    if not process_manager.is_running():
+        LOGGER.info("ComfyUI is not running. Attempting auto-start...")
+        # Ensure no zombie processes on other ports if we want to enforce port 8000
+        process_manager.kill_all_instances()
+        process_manager.start()
+    else:
+        LOGGER.info("ComfyUI is already running.")
 
     application = build_application(config, resources)
 
