@@ -1,99 +1,18 @@
-MIT License with Commercial Use Notification Clause
+# Dual License
 
-═══════════════════════════════════════════════════════════════════════════
+This project is dual-licensed. You may choose to use it under one of the following licenses:
+
+## 1. Non-Commercial License (AGPL-3.0)
+For non-commercial use, this software is licensed under the GNU Affero General Public License v3.0.
+See LICENSE-AGPL for full terms.
+
+## 2. Commercial License
+For commercial use, you must obtain a separate commercial license from the copyright holder.
+Contact: vitalikden0@gmail.com
+
+---
 
 Copyright (c) 2025 Vitaly Denisov (VitalikDen0)
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-1. ATTRIBUTION REQUIREMENT
-   The above copyright notice and this permission notice shall be included in 
-   all copies or substantial portions of the Software.
-
-2. COMMERCIAL USE NOTIFICATION
-   a) Individual developers and small businesses (annual revenue < $1M USD):
-      - May use the Software commercially without additional licensing
-      - Must provide attribution to the original author
-   
-   b) Medium and large enterprises (annual revenue >= $1M USD):
-      - Must notify the author before commercial deployment
-      - Contact: GitHub @VitalikDen0 or [your email]
-      - Commercial licensing terms will be negotiated individually
-   
-   c) For all commercial users:
-      - Attribution must be visible in product documentation or about section
-      - Modifications must be clearly indicated
-
-3. DISCLAIMER
-   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-   SOFTWARE.
-
-═══════════════════════════════════════════════════════════════════════════
-
-РУССКАЯ ВЕРСИЯ | RUSSIAN VERSION
-
-═══════════════════════════════════════════════════════════════════════════
-
-Лицензия MIT с оговоркой об уведомлении при коммерческом использовании
-
-Авторские права (c) 2025 Виталий Денисов (VitalikDen0)
-
-Данная лицензия разрешает любому лицу, получившему копию данного программного
-обеспечения и сопутствующей документации (в дальнейшем именуемыми «Программное
-обеспечение»), безвозмездно использовать Программное обеспечение без ограничений,
-включая неограниченное право на использование, копирование, изменение, слияние,
-публикацию, распространение, сублицензирование и/или продажу копий Программного
-обеспечения, а также лицам, которым предоставляется данное Программное обеспечение,
-при соблюдении следующих условий:
-
-1. ТРЕБОВАНИЕ УКАЗАНИЯ АВТОРСТВА
-   Указанное выше уведомление об авторских правах и данные условия должны быть
-   включены во все копии или значимые части данного Программного обеспечения.
-
-2. УВЕДОМЛЕНИЕ О КОММЕРЧЕСКОМ ИСПОЛЬЗОВАНИИ
-   а) Индивидуальные разработчики и малый бизнес (годовой доход < $1M USD):
-      - Могут использовать ПО коммерчески без дополнительного лицензирования
-      - Должны указывать авторство оригинального автора
-   
-   б) Средние и крупные компании (годовой доход >= $1M USD):
-      - Должны уведомить автора перед коммерческим использованием
-      - Контакты: GitHub @VitalikDen0 или dlaproektov96@gmail.com
-      - Условия коммерческого лицензирования обсуждаются индивидуально
-   
-   в) Для всех коммерческих пользователей:
-      - Указание авторства должно быть видно в документации продукта или разделе "О программе"
-      - Модификации должны быть явно указаны
-
-3. ОТКАЗ ОТ ГАРАНТИЙ
-   ДАННОЕ ПРОГРАММНОЕ ОБЕСПЕЧЕНИЕ ПРЕДОСТАВЛЯЕТСЯ «КАК ЕСТЬ», БЕЗ КАКИХ-ЛИБО
-   ГАРАНТИЙ, ЯВНО ВЫРАЖЕННЫХ ИЛИ ПОДРАЗУМЕВАЕМЫХ, ВКЛЮЧАЯ ГАРАНТИИ ТОВАРНОЙ
-   ПРИГОДНОСТИ, СООТВЕТСТВИЯ ПО ЕГО КОНКРЕТНОМУ НАЗНАЧЕНИЮ И ОТСУТСТВИЯ НАРУШЕНИЙ,
-   НО НЕ ОГРАНИЧИВАЯСЬ ИМИ. НИ В КАКОМ СЛУЧАЕ АВТОРЫ ИЛИ ПРАВООБЛАДАТЕЛИ НЕ НЕСУТ
-   ОТВЕТСТВЕННОСТИ ПО КАКИМ-ЛИБО ИСКАМ, ЗА УЩЕРБ ИЛИ ПО ИНЫМ ТРЕБОВАНИЯМ, В ТОМ
-   ЧИСЛЕ, ПРИ ДЕЙСТВИИ КОНТРАКТА, ДЕЛИКТЕ ИЛИ ИНОЙ СИТУАЦИИ, ВОЗНИКШИМ ИЗ-ЗА
-   ИСПОЛЬЗОВАНИЯ ПРОГРАММНОГО ОБЕСПЕЧЕНИЯ ИЛИ ИНЫХ ДЕЙСТВИЙ С ПРОГРАММНЫМ
-   ОБЕСПЕЧЕНИЕМ.
-
-═══════════════════════════════════════════════════════════════════════════
-
-CONTACT | КОНТАКТЫ
-
-Original Repository: https://github.com/VitalikDen0/ComfyUI-TelegramBot
-Author: Vitaly Denisov (VitalikDen0)
-GitHub: @VitalikDen0
-Email: dlaproektov96@gmail.com
-
-For commercial licensing inquiries, please contact via GitHub Issues or email.
-Для запросов о коммерческом лицензировании свяжитесь через GitHub Issues или email.
-
-═══════════════════════════════════════════════════════════════════════════
+For commercial licensing inquiries, please contact the author directly.
+All commercial licensing terms are negotiated individually.
