@@ -17,7 +17,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, MutableMapping, Union, cast, Mapping, Sequence, Tuple
 
-from telegram import Bot, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import Bot, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, MenuButtonWebApp, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update, WebAppInfo
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -109,6 +109,7 @@ WORKFLOW_EXPORT = "workflow:export"
 WORKFLOW_REFRESH = "workflow:refresh"
 WORKFLOW_CANCEL = "workflow:cancel"
 WORKFLOW_CONNECT_NODE_PREFIX = "workflow:connect-node:"
+WORKFLOW_WEBAPP = "workflow:webapp"
 CONNECTION_INPUT_PREFIX = "conn:input:"
 CONNECTION_SOURCE_PREFIX = "conn:source:"
 CONNECTION_SOURCE_PAGE_PREFIX = "conn:src-page:"
@@ -550,6 +551,7 @@ WORKFLOW_ACTIONS: tuple[str, ...] = (
     WORKFLOW_ADD_NODE,
     WORKFLOW_LAUNCH,
     WORKFLOW_EXPORT,
+    WORKFLOW_WEBAPP,
     MENU_BACK,
 )
 
@@ -557,6 +559,7 @@ WORKFLOW_DISPLAY_TEXT: dict[str, str] = {
     WORKFLOW_ADD_NODE: "➕ Создать ноду",
     WORKFLOW_LAUNCH: "🚀 Запустить",
     WORKFLOW_EXPORT: "📤 Экспорт",
+    WORKFLOW_WEBAPP: "📊 Визуализация (Mini App)",
     MENU_BACK: "⬅️ В меню",
 }
 
@@ -571,6 +574,42 @@ SAVE_OUTPUT_NODE_TYPES: set[str] = {
 }
 
 DEFAULT_FILENAME_PREFIX = "ComfyUI\\temp"
+
+EMPTY_LATENT_NODE_TYPE = "EmptyLatentImage"
+EMPTY_LATENT_DIM_PARAMS = {"width", "height"}
+EMPTY_LATENT_DIMENSION_HINT = (
+    "ℹ️ <b>Empty Latent Image</b>\n"
+    "⚠️ Ширина и высота должны быть кратны 8 — ComfyUI заполняет латентное пространство блоками 8×8.\n\n"
+    "NOTE: For SDXL, use the trained values below:\n"
+    " • 1024 × 1024\n"
+    " • 1152 × 896\n"
+    " • 896 × 1152\n"
+    " • 1216 × 832\n"
+    " • 832 × 1216\n"
+    " • 1344 × 768\n"
+    " • 768 × 1344\n"
+    " • 1536 × 640\n"
+    " • 640 × 1536\n"
+    "<i>Дополнительные промежуточные:</i>\n"
+    " • 1408 × 832\n"
+    " • 832 × 1408\n"
+    " • 1472 × 704\n"
+    " • 704 × 1472\n\n"
+    "IL 2.0:\n"
+    " • 1024 × 1536\n"
+    " • 1536 × 1536\n"
+    " • 1344 × 1728\n"
+    " • 1248 × 1824\n"
+    " • 1152 × 2016\n"
+    " • 2016 × 1152\n"
+    " • 1728 × 1344\n"
+    " • 1824 × 1248\n"
+    "<i>Дополнительные промежуточные:</i>\n"
+    " • 1408 × 1664\n"
+    " • 1664 × 1408\n"
+    " • 1600 × 1792\n"
+    " • 1792 × 1600\n"
+)
 
 QUEUE_ACTIONS: tuple[str, ...] = (
     QUEUE_REFRESH,
@@ -4296,6 +4335,11 @@ async def prompt_param_update(
     if quick_choices:
         text_lines.append("Можно выбрать кнопку или отправить текст.")
 
+    hint_text = _build_param_hint_text(node, parameter)
+    if hint_text:
+        text_lines.append("")
+        text_lines.append(hint_text)
+
     mapping: dict[str, ButtonAction] = {}
     rows: list[list[str]] = []
     if quick_choices:
@@ -4562,6 +4606,15 @@ async def _collect_param_choices(
     return []
 
 
+def _build_param_hint_text(node: Dict[str, Any], parameter: str) -> Optional[str]:
+    if not isinstance(node, dict):
+        return None
+    node_type = str(node.get("class_type") or node.get("type") or "")
+    if node_type == EMPTY_LATENT_NODE_TYPE and parameter in EMPTY_LATENT_DIM_PARAMS:
+        return EMPTY_LATENT_DIMENSION_HINT
+    return None
+
+
 async def _build_dynamic_model_choices(
     context: ContextTypes.DEFAULT_TYPE,
     node: Dict[str, Any],
@@ -4710,6 +4763,18 @@ def _resolve_choice_value(
     return value
 
 
+def _validate_node_parameter_value(node: Dict[str, Any], parameter: str, value: Any) -> Any:
+    node_type = str(node.get("class_type") or node.get("type") or "")
+    if node_type == EMPTY_LATENT_NODE_TYPE and parameter in EMPTY_LATENT_DIM_PARAMS:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("Введите целое число, кратное 8.")
+        if value % 8 != 0:
+            raise ValueError("Значение должно быть кратно 8 (размер латентов делится на 8).")
+        if value <= 0:
+            raise ValueError("Значение должно быть больше нуля.")
+    return value
+
+
 async def _collect_enum_validation_errors(resources: BotResources, workflow: Dict[str, Any]) -> list[str]:
     nodes = workflow.get("nodes")
     if isinstance(nodes, dict):
@@ -4838,8 +4903,19 @@ async def _set_node_parameter_value(
         )
         return
 
+    try:
+        validated_value = _validate_node_parameter_value(node, parameter, new_value)
+    except ValueError as exc:
+        await respond(
+            source,
+            f"⚠️ {escape(str(exc))}",
+            parse_mode=ParseMode.HTML,
+            edit=False,
+        )
+        return
+
     inputs = node.setdefault("inputs", {})
-    inputs[parameter] = new_value
+    inputs[parameter] = validated_value
 
     resources = require_resources(context)
     user_id = get_user_id_from_source(source)
@@ -6675,6 +6751,8 @@ def _workflow_action_from_text(text: str | None) -> Optional[str]:
     cleaned = text.strip()
     if not cleaned:
         return None
+    if cleaned == "📊 Визуализация (Mini App)":
+        return WORKFLOW_WEBAPP
     return WORKFLOW_TEXT_TO_ACTION.get(cleaned)
 
 
@@ -6808,6 +6886,11 @@ def _workflow_reply_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: int) -
         WORKFLOW_DISPLAY_TEXT[WORKFLOW_EXPORT],
     ]
     rows.append(action_row)
+
+    resources = require_resources(context)
+    if resources.config.webapp_url:
+        rows.append(["📊 Визуализация (Mini App)"])
+
     rows.append([WORKFLOW_DISPLAY_TEXT[MENU_BACK]])
 
     if isinstance(workflow, dict):
@@ -7206,6 +7289,18 @@ async def _flush_persistence(context: ContextTypes.DEFAULT_TYPE) -> None:
 def build_application(config: BotConfig, resources: BotResources) -> Application:
     persistence = PicklePersistence(filepath=str(config.persistence_path))
 
+    async def _setup_menu_button(application: Application) -> None:
+        url = config.webapp_url
+        if not url:
+            return
+        try:
+            await application.bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(text="📊 Визуализация", web_app=WebAppInfo(url=url))
+            )
+            LOGGER.info("Chat menu button configured for WebApp: %s", url)
+        except Exception:  # pragma: no cover - best effort
+            LOGGER.warning("Failed to configure chat menu button", exc_info=True)
+
     async def _shutdown(_: Application) -> None:
         await resources.shutdown()
 
@@ -7213,6 +7308,7 @@ def build_application(config: BotConfig, resources: BotResources) -> Application
         Application.builder()
         .token(config.bot_token)
         .persistence(persistence)
+        .post_init(_setup_menu_button)
         .post_shutdown(_shutdown)
         .build()
     )
@@ -7289,14 +7385,17 @@ def main() -> None:
     process_manager = ComfyProcessManager(config)
     resources = BotResources(config=config, storage=storage, client=client, process_manager=process_manager)
 
-    # Auto-start ComfyUI logic
-    if not process_manager.is_running():
-        LOGGER.info("ComfyUI is not running. Attempting auto-start...")
-        # Ensure no zombie processes on other ports if we want to enforce port 8000
-        process_manager.kill_all_instances()
-        process_manager.start()
+    # Auto-start ComfyUI logic (optional)
+    if config.check_comfy_running:
+        if not process_manager.is_running():
+            LOGGER.info("ComfyUI is not running. Attempting auto-start...")
+            # Ensure no zombie processes on other ports if we want to enforce port 8000
+            process_manager.kill_all_instances()
+            process_manager.start()
+        else:
+            LOGGER.info("ComfyUI is already running.")
     else:
-        LOGGER.info("ComfyUI is already running.")
+        LOGGER.info("Skipping ComfyUI running check (CHECK_COMFY_RUNNING=false); relying on endpoint auto-detection.")
 
     application = build_application(config, resources)
 

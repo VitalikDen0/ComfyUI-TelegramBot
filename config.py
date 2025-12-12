@@ -19,9 +19,18 @@ class BotConfig:
     output_dir: Path
     shared_output_dir: Path
     persistence_path: Path
+    check_comfy_running: bool = False
+    webapp_url: Optional[str] = None
     restart_command: Optional[str] = None
     workflow_templates_dir: Optional[Path] = None
     default_workflow_path: Optional[Path] = None
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_config() -> BotConfig:
@@ -43,6 +52,8 @@ def load_config() -> BotConfig:
     restart_cmd = os.getenv("COMFYUI_RESTART_CMD")
     templates_dir_env = os.getenv("COMFYUI_WORKFLOW_TEMPLATES_DIR")
     default_workflow_env = os.getenv("DEFAULT_WORKFLOW_FILE")
+    check_comfy_running = _env_bool("CHECK_COMFY_RUNNING", default=False)
+    webapp_url = os.getenv("WEBAPP_URL")
 
     if templates_dir_env:
         templates_dir = Path(templates_dir_env).expanduser().resolve()
@@ -67,6 +78,8 @@ def load_config() -> BotConfig:
         output_dir=output_dir,
         shared_output_dir=shared_output,
         persistence_path=base_dir / persistence_name,
+        check_comfy_running=check_comfy_running,
+        webapp_url=webapp_url,
         restart_command=restart_cmd,
         workflow_templates_dir=templates_dir,
         default_workflow_path=default_workflow_path,
