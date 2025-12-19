@@ -25,6 +25,7 @@ bot_state.pkl
 *.swp
 *.swo
 *~
+.github
 
 # Логи
 *.log
