@@ -16,6 +16,9 @@ ENV/
 
 # Данные бота
 data/
+!data/templates/
+!data/templates/builtin/
+!data/templates/builtin/**
 Output/
 bot_state.pkl
 

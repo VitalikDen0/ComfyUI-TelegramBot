@@ -2227,6 +2227,7 @@ async def apply_template(
         template["workflow"] = workflow
 
     workflow_copy = _copy_workflow_graph(workflow)
+    _ensure_nodes_container(workflow_copy)
     preferred_name = template.get("name") or "template"
     workflow_name = _unique_workflow_name(resources.storage, user_id, preferred_name)
 
@@ -5201,6 +5202,7 @@ async def ensure_workflow_loaded(
     if workflow is None:
         workflow = resources.storage.ensure_default_workflow_for_user(user_id, name)
     if workflow is not None:
+        _ensure_nodes_container(workflow)
         get_user_data(context)["workflow"] = workflow
     return workflow
 
@@ -6203,10 +6205,45 @@ def _reset_connection_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     get_user_data(context).pop("connection_state", None)
 
 
+def _looks_like_node_entry(key: Any, value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if any(field in value for field in ("class_type", "type", "inputs")):
+        return True
+    try:
+        int(str(key))
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _ensure_nodes_container(workflow: Dict[str, Any]) -> Any:
+    if not isinstance(workflow, dict):
+        return {}
+
+    for key in ("nodes", "prompt", "workflow", "graph"):
+        candidate = workflow.get(key)
+        if isinstance(candidate, (dict, list)):
+            workflow["nodes"] = candidate
+            return candidate
+
+    candidate_nodes: Dict[str, Any] = {}
+    for key, value in workflow.items():
+        if _looks_like_node_entry(key, value):
+            candidate_nodes[str(key)] = value
+
+    if candidate_nodes:
+        workflow["nodes"] = candidate_nodes
+        return candidate_nodes
+
+    workflow["nodes"] = {}
+    return workflow["nodes"]
+
+
 def normalize_workflow_structure(workflow: Dict[str, Any], catalog: Optional[Dict[str, Any]] = None) -> list[str]:
     missing: list[str] = []
 
-    nodes_raw = workflow.get("nodes")
+    nodes_raw = _ensure_nodes_container(workflow)
     if isinstance(nodes_raw, dict):
         node_items = [(str(key), value) for key, value in nodes_raw.items() if isinstance(value, dict)]
     elif isinstance(nodes_raw, list):

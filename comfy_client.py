@@ -42,7 +42,7 @@ class ExecutionResult:
 class ComfyUIClient:
     """Async client for ComfyUI REST and WebSocket APIs."""
 
-    _MODEL_EXTENSIONS: tuple[str, ...] = (".safetensors", ".ckpt", ".pth", ".pt", ".onnx", ".gguf")
+    _MODEL_EXTENSIONS: tuple[str, ...] = (".safetensors", ".ckpt", ".pth", ".pt", ".onnx", ".gguf", ".engine")
 
     def __init__(
         self,
