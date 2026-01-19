@@ -893,7 +893,9 @@ async def _start_webapp_api_server(resources: BotResources) -> None:
     ])
 
     if serve_static and static_path is not None:
-        app.router.add_static("/", static_path, show_index=False)
+        assets_path = static_path / "assets"
+        if assets_path.exists():
+            app.router.add_static("/assets", assets_path, show_index=False)
 
         async def _serve_index(_: web.Request) -> web.StreamResponse:
             if index_path is None:
