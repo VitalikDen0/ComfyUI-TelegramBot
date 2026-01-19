@@ -42,7 +42,13 @@ OUTPUT_DIR=Output
 COMFYUI_SHARED_OUTPUT_DIR=Output
 PERSISTENCE_FILE=bot_state.pkl
 CHECK_COMFY_RUNNING=false
+LOG_BOOT_DEBUG_SECONDS=30            # если LOG_LEVEL не DEBUG, держать DEBUG первые N секунд
 WEBAPP_URL=https://your-miniapp-url  # для кнопки Mini App
+WEBAPP_API_HOST=0.0.0.0             # хост для API Mini App (по умолчанию 0.0.0.0)
+WEBAPP_API_PORT=8081                # порт API Mini App
+WEBAPP_API_ENABLED=true             # выключите при внешнем API
+WEBAPP_SERVE_ENABLED=false          # если true и собран webapp/dist — раздаём Mini App статикой
+WEBAPP_SERVE_PATH=webapp/dist       # путь к собранному фронту Mini App
 ```
 
 ## Запуск

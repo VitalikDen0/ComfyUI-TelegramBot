@@ -21,6 +21,11 @@ class BotConfig:
     persistence_path: Path
     check_comfy_running: bool = False
     webapp_url: Optional[str] = None
+    webapp_api_host: str = "0.0.0.0"
+    webapp_api_port: int = 8081
+    webapp_api_enabled: bool = True
+    webapp_serve_enabled: bool = False
+    webapp_serve_path: Optional[Path] = None
     restart_command: Optional[str] = None
     workflow_templates_dir: Optional[Path] = None
     default_workflow_path: Optional[Path] = None
@@ -54,11 +59,21 @@ def load_config() -> BotConfig:
     default_workflow_env = os.getenv("DEFAULT_WORKFLOW_FILE")
     check_comfy_running = _env_bool("CHECK_COMFY_RUNNING", default=False)
     webapp_url = os.getenv("WEBAPP_URL")
+    webapp_api_host = os.getenv("WEBAPP_API_HOST", "0.0.0.0")
+    webapp_api_port = int(os.getenv("WEBAPP_API_PORT", "8081"))
+    webapp_api_enabled = _env_bool("WEBAPP_API_ENABLED", default=True)
+    webapp_serve_enabled = _env_bool("WEBAPP_SERVE_ENABLED", default=False)
+    webapp_serve_path_env = os.getenv("WEBAPP_SERVE_PATH")
 
     if templates_dir_env:
         templates_dir = Path(templates_dir_env).expanduser().resolve()
     else:
         templates_dir = (base_dir / "templates").resolve()
+
+    if webapp_serve_path_env:
+        webapp_serve_path = Path(webapp_serve_path_env).expanduser().resolve()
+    else:
+        webapp_serve_path = Path(__file__).resolve().parent / "webapp" / "dist"
 
     if default_workflow_env:
         default_workflow_path = Path(default_workflow_env).expanduser().resolve()
@@ -80,6 +95,11 @@ def load_config() -> BotConfig:
         persistence_path=base_dir / persistence_name,
         check_comfy_running=check_comfy_running,
         webapp_url=webapp_url,
+        webapp_api_host=webapp_api_host,
+        webapp_api_port=webapp_api_port,
+        webapp_api_enabled=webapp_api_enabled,
+        webapp_serve_enabled=webapp_serve_enabled,
+        webapp_serve_path=webapp_serve_path,
         restart_command=restart_cmd,
         workflow_templates_dir=templates_dir,
         default_workflow_path=default_workflow_path,

@@ -10,6 +10,8 @@ import secrets
 import shutil
 import time
 import re
+import threading
+from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 from dataclasses import dataclass
 from datetime import datetime
 from html import escape
@@ -35,6 +37,7 @@ from comfy_manager import ComfyProcessManager
 from config import BotConfig, load_config
 from storage import WorkflowStorage, get_user_id
 from workflow_render import format_workflow_summary
+from aiohttp import web
 
 LOGGER = logging.getLogger(__name__)
 
@@ -46,6 +49,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 ACTIVE_TASKS: dict[int, asyncio.Task] = {}
+WEBAPP_SESSIONS: dict[str, dict[str, Any]] = {}
+WEBAPP_SESSION_TTL_SECONDS = 5 * 60
+WEBAPP_SESSION_LIMIT = 500
 
 MessageSource = Update | Message | CallbackQuery
 UserDataDict = MutableMapping[str, Any]
@@ -137,6 +143,8 @@ MODEL_PARAM_TYPE_BY_NODE: Dict[tuple[str, str], str] = {
     ("CheckpointLoader", "vae_name"): "vae",
     ("CheckpointLoaderSimple", "clip_name"): "clip",
     ("CheckpointLoader", "clip_name"): "clip",
+    ("CLIPTextEncode", "text_encoder"): "text_encoders",
+    ("CLIPTextEncode", "text_encoder_name"): "text_encoders",
     ("LoraLoader", "lora_name"): "loras",
     ("LoRALoader", "lora_name"): "loras",
     ("LoraLoaderModelOnly", "lora_name"): "loras",
@@ -156,6 +164,8 @@ GENERIC_MODEL_PARAM_TYPES: Dict[str, str] = {
     "ckpt_name": "checkpoints",
     "vae_name": "vae",
     "clip_name": "clip",
+    "text_encoder": "text_encoders",
+    "text_encoder_name": "text_encoders",
     "lora_name": "loras",
     "controlnet_name": "controlnet",
     "control_net_name": "controlnet",
@@ -658,8 +668,22 @@ class BotResources:
     storage: WorkflowStorage
     client: ComfyUIClient
     process_manager: ComfyProcessManager
+    api_runner: Optional[web.AppRunner] = None
+    api_site: Optional[web.TCPSite] = None
+    api_app: Optional[web.Application] = None
+    api_cleanup_task: Optional[asyncio.Task] = None
+    webapp_index_path: Optional[Path] = None
+    api_error: Optional[str] = None
+    effective_webapp_url: Optional[str] = None
 
     async def shutdown(self) -> None:
+        if self.api_runner is not None:
+            try:
+                await self.api_runner.cleanup()
+            except Exception:  # pragma: no cover - best effort
+                LOGGER.debug("Failed to cleanup webapp api runner", exc_info=True)
+        if self.api_cleanup_task is not None:
+            self.api_cleanup_task.cancel()
         await self.client.close()
 
 
@@ -746,6 +770,44 @@ def _log_user_event(resources: BotResources, user_id: int, event: str, **extra: 
     LOGGER.info(general_text)
 
 
+def _purge_webapp_sessions(now: Optional[float] = None) -> None:
+    current = now or time.time()
+    for sid, payload in list(WEBAPP_SESSIONS.items()):
+        expires_at = payload.get("expires_at", 0)
+        if expires_at and expires_at < current:
+            WEBAPP_SESSIONS.pop(sid, None)
+
+
+def _create_webapp_session(workflow: Dict[str, Any]) -> str:
+    _purge_webapp_sessions()
+    if len(WEBAPP_SESSIONS) >= WEBAPP_SESSION_LIMIT:
+        # drop oldest
+        sorted_items = sorted(WEBAPP_SESSIONS.items(), key=lambda item: item[1].get("created_at", 0))
+        for sid, _ in sorted_items[: max(1, WEBAPP_SESSION_LIMIT // 5)]:
+            WEBAPP_SESSIONS.pop(sid, None)
+
+    session_id = secrets.token_urlsafe(12)
+    now = time.time()
+    WEBAPP_SESSIONS[session_id] = {
+        "workflow": workflow,
+        "created_at": now,
+        "expires_at": now + WEBAPP_SESSION_TTL_SECONDS,
+    }
+    return session_id
+
+
+def _get_webapp_session(session_id: str) -> Optional[Dict[str, Any]]:
+    _purge_webapp_sessions()
+    session = WEBAPP_SESSIONS.get(session_id)
+    if not session:
+        return None
+    expires_at = session.get("expires_at", 0)
+    if expires_at and expires_at < time.time():
+        WEBAPP_SESSIONS.pop(session_id, None)
+        return None
+    return session
+
+
 def _ensure_default_assets(config: BotConfig) -> None:
     default_path = config.default_workflow_path
     if default_path is None:
@@ -782,6 +844,90 @@ def _ensure_default_assets(config: BotConfig) -> None:
                     shutil.copy2(default_path, destination)
     except Exception:
         LOGGER.warning("Не удалось синхронизировать default workflow в каталог шаблонов", exc_info=True)
+
+
+async def _webapp_session_cleanup_loop() -> None:
+    try:
+        while True:
+            await asyncio.sleep(60)
+            _purge_webapp_sessions()
+    except asyncio.CancelledError:  # pragma: no cover - cooperative shutdown
+        return
+
+
+async def _handle_webapp_workflow(request: web.Request) -> web.Response:
+    session_id = request.match_info.get("session_id", "")
+    session = _get_webapp_session(session_id)
+    if not session:
+        return web.json_response({"error": "Session not found or expired"}, status=404)
+    return web.json_response({"workflow": session.get("workflow")})
+
+
+async def _handle_health(_: web.Request) -> web.Response:
+    return web.json_response({"status": "ok", "sessions": len(WEBAPP_SESSIONS)})
+
+
+async def _start_webapp_api_server(resources: BotResources) -> None:
+    if resources.api_runner is not None:
+        return
+    if not resources.config.webapp_api_enabled:
+        LOGGER.info("WebApp API disabled via config")
+        return
+
+    app = web.Application()
+
+    static_path = resources.config.webapp_serve_path
+    serve_static = resources.config.webapp_serve_enabled and static_path is not None and static_path.exists()
+    index_path: Optional[Path] = None
+    if serve_static and static_path is not None:
+        index_candidate = static_path / "index.html"
+        if index_candidate.exists():
+            index_path = index_candidate
+        else:
+            LOGGER.warning("WEBAPP_SERVE_ENABLED=true, но index.html не найден по пути %s", index_candidate)
+            serve_static = False
+
+    app.add_routes([
+        web.get("/api/workflow/{session_id}", _handle_webapp_workflow),
+        web.get("/api/health", _handle_health),
+    ])
+
+    if serve_static and static_path is not None:
+        app.router.add_static("/", static_path, show_index=False)
+
+        async def _serve_index(_: web.Request) -> web.StreamResponse:
+            if index_path is None:
+                return web.Response(status=404, text="index.html not found")
+            return web.FileResponse(index_path)
+
+        app.router.add_get("/", _serve_index)
+        app.router.add_get("/{tail:.*}", _serve_index)
+        resources.webapp_index_path = index_path
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, resources.config.webapp_api_host, resources.config.webapp_api_port)
+    await site.start()
+
+    resources.api_app = app
+    resources.api_runner = runner
+    resources.api_site = site
+    resources.api_cleanup_task = asyncio.create_task(_webapp_session_cleanup_loop())
+    resources.api_error = None
+
+    base_url = f"http://{resources.config.webapp_api_host}:{resources.config.webapp_api_port}"
+    if resources.config.webapp_url:
+        resources.effective_webapp_url = resources.config.webapp_url
+    elif resources.config.webapp_serve_enabled and serve_static:
+        resources.effective_webapp_url = base_url + "/"
+    else:
+        resources.effective_webapp_url = resources.config.webapp_url
+
+    LOGGER.info(
+        "WebApp API started at %s (serve_static=%s)",
+        base_url,
+        serve_static,
+    )
 
 
 def _apply_default_filename_prefix(workflow: Dict[str, Any], prefix: str = DEFAULT_FILENAME_PREFIX) -> None:
@@ -6853,6 +6999,10 @@ async def _dispatch_workflow_action(
         await export_current_workflow(message_source, context)
         return True
 
+    if action == WORKFLOW_WEBAPP:
+        await open_workflow_webapp(message_source, context)
+        return True
+
     if action == MENU_BACK:
         return await _dispatch_menu_action(message_source, context, MENU_BACK, via_callback=isinstance(message_source, CallbackQuery))
 
@@ -6925,7 +7075,7 @@ def _workflow_reply_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: int) -
     rows.append(action_row)
 
     resources = require_resources(context)
-    if resources.config.webapp_url:
+    if resources.config.webapp_api_enabled or resources.config.webapp_url or resources.config.webapp_serve_enabled:
         rows.append(["📊 Визуализация (Mini App)"])
 
     rows.append([WORKFLOW_DISPLAY_TEXT[MENU_BACK]])
@@ -6947,6 +7097,90 @@ def _workflow_reply_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: int) -
             rows.append(current_row)
 
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def _build_webapp_url(base_url: str, session_id: str) -> str:
+    parsed = urlparse(base_url)
+    query_items = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query_items["sid"] = session_id
+    new_query = urlencode(query_items)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path or "", parsed.params, new_query, parsed.fragment))
+
+
+def _effective_webapp_base(resources: BotResources) -> Optional[str]:
+    if resources.effective_webapp_url:
+        return resources.effective_webapp_url
+    if resources.config.webapp_url:
+        return resources.config.webapp_url
+    if resources.config.webapp_serve_enabled and resources.config.webapp_api_enabled:
+        return f"http://{resources.config.webapp_api_host}:{resources.config.webapp_api_port}/"
+    return None
+
+
+async def open_workflow_webapp(message_source: MessageSource, context: ContextTypes.DEFAULT_TYPE) -> None:
+    resources = require_resources(context)
+    config = resources.config
+    if not config.webapp_api_enabled:
+        await respond(
+            message_source,
+            "⚠️ Mini App не запущен: WEBAPP_API_ENABLED=false",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if resources.api_runner is None:
+        reason = resources.api_error or "API не было запущено"
+        await respond(
+            message_source,
+            f"⚠️ Mini App недоступен: {escape(reason)}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    user_id = get_user_id_from_source(message_source)
+    workflow = await ensure_workflow_loaded(context, resources, user_id)
+    if not isinstance(workflow, dict):
+        await respond(
+            message_source,
+            "ℹ️ Нет активного workflow. Создайте или импортируйте граф, чтобы открыть Mini App.",
+            _workflow_markup_for_source(context, message_source, user_id),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Нормализуем и копируем граф, чтобы сессия была компактной и неизменяемой
+    workflow_copy = _copy_workflow_graph(workflow)
+    normalize_workflow_structure(workflow_copy)
+    session_id = _create_webapp_session(workflow_copy)
+
+    base_url = _effective_webapp_base(resources)
+    if not base_url:
+        await respond(
+            message_source,
+            "⚠️ Mini App не настроен: задайте WEBAPP_URL или включите WEBAPP_SERVE_ENABLED",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        await _start_webapp_api_server(resources)
+    except Exception:  # pragma: no cover - best effort
+        LOGGER.exception("Не удалось стартовать WebApp API перед выдачей ссылки")
+
+    url = _build_webapp_url(base_url, session_id)
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📊 Открыть Mini App", web_app=WebAppInfo(url=url))],
+            [InlineKeyboardButton("🌐 Открыть в браузере", url=url)],
+        ]
+    )
+
+    await respond(
+        message_source,
+        "🎨 Открывайте Mini App по кнопке ниже. Сессия активна 5 минут.",
+        keyboard,
+        parse_mode=ParseMode.HTML,
+    )
 
 
 def _workflow_keyboard(
@@ -7326,17 +7560,26 @@ async def _flush_persistence(context: ContextTypes.DEFAULT_TYPE) -> None:
 def build_application(config: BotConfig, resources: BotResources) -> Application:
     persistence = PicklePersistence(filepath=str(config.persistence_path))
 
-    async def _setup_menu_button(application: Application) -> None:
-        url = config.webapp_url
-        if not url:
-            return
+    async def _post_init(application: Application) -> None:
         try:
-            await application.bot.set_chat_menu_button(
-                menu_button=MenuButtonWebApp(text="📊 Визуализация", web_app=WebAppInfo(url=url))
-            )
-            LOGGER.info("Chat menu button configured for WebApp: %s", url)
-        except Exception:  # pragma: no cover - best effort
-            LOGGER.warning("Failed to configure chat menu button", exc_info=True)
+            await _start_webapp_api_server(resources)
+        except Exception as exc:
+            resources.api_error = str(exc)
+            LOGGER.exception("Failed to start WebApp API server")
+
+        url = resources.effective_webapp_url or config.webapp_url
+        if url:
+            parsed_url = urlparse(url)
+            if parsed_url.scheme.lower() == "https":
+                try:
+                    await application.bot.set_chat_menu_button(
+                        menu_button=MenuButtonWebApp(text="📊 Визуализация", web_app=WebAppInfo(url=url))
+                    )
+                    LOGGER.info("Chat menu button configured for WebApp: %s", url)
+                except Exception:  # pragma: no cover - best effort
+                    LOGGER.warning("Failed to configure chat menu button", exc_info=True)
+            else:
+                LOGGER.info("Chat menu button skipped: URL is not https (%s)", url)
 
     async def _shutdown(_: Application) -> None:
         await resources.shutdown()
@@ -7345,7 +7588,7 @@ def build_application(config: BotConfig, resources: BotResources) -> Application
         Application.builder()
         .token(config.bot_token)
         .persistence(persistence)
-        .post_init(_setup_menu_button)
+        .post_init(_post_init)
         .post_shutdown(_shutdown)
         .build()
     )
@@ -7363,15 +7606,29 @@ def build_application(config: BotConfig, resources: BotResources) -> Application
 
 
 def _configure_logging(config: BotConfig) -> None:
-    log_level_name = os.getenv("LOG_LEVEL", "DEBUG").upper()
-    log_level = getattr(logging, log_level_name, logging.INFO)
+    log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    target_level = getattr(logging, log_level_name, logging.INFO)
+    boot_debug_seconds = int(os.getenv("LOG_BOOT_DEBUG_SECONDS", "30"))
+    use_boot_debug = target_level != logging.DEBUG and boot_debug_seconds > 0
+    initial_level = logging.DEBUG if use_boot_debug else target_level
+
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(log_level)
     console_handler.setFormatter(formatter)
+    console_handler.setLevel(initial_level)
 
-    logging.basicConfig(level=log_level, handlers=[console_handler], format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.basicConfig(level=initial_level, handlers=[console_handler], format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    def _set_level(level: int) -> None:
+        logging.getLogger().setLevel(level)
+        for handler in list(logging.getLogger().handlers):
+            try:
+                handler.setLevel(level)
+            except Exception:
+                pass
+
+    _set_level(initial_level)
 
     log_dir_env = os.getenv("LOG_DIR")
     log_dir = Path(log_dir_env).expanduser().resolve() if log_dir_env else (config.data_dir / "logs").resolve()
@@ -7401,12 +7658,25 @@ def _configure_logging(config: BotConfig) -> None:
     try:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(file_path, mode="a", encoding="utf-8")
-        file_handler.setLevel(log_level)
         file_handler.setFormatter(formatter)
+        file_handler.setLevel(initial_level)
         logging.getLogger().addHandler(file_handler)
         logging.getLogger(__name__).info("Файловый лог: %s", file_path)
     except Exception:  # pragma: no cover - логирование не должно ломать бот
         logging.getLogger(__name__).warning("Не удалось настроить файловый лог", exc_info=True)
+
+    if use_boot_debug:
+        def _degrade_logging() -> None:
+            _set_level(target_level)
+            logging.getLogger(__name__).info(
+                "Логирование переведено в %s после %s сек.",
+                logging.getLevelName(target_level),
+                boot_debug_seconds,
+            )
+
+        timer = threading.Timer(boot_debug_seconds, _degrade_logging)
+        timer.daemon = True
+        timer.start()
 
 
 def main() -> None:
